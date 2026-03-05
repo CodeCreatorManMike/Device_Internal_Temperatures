@@ -1,40 +1,21 @@
-PS C:\Users\Dell Test - 1\Desktop> ./Diagnose-DellThermals.ps1
+PS C:\WINDOWS\system32> & "C:\Users\Dell Test - 1\Desktop\Repair-DellWmiAndDcm.ps1"
 
---- Dell Thermal Telemetry Diagnostic ---
-Timestamp: 2026-03-05T10:45:25.6897841+00:00
-Admin: False
+========== Dell WMI & DCM Remediation (Admin) ==========
 
-Manufacturer: Dell Inc. | Model: Latitude 3420 | SKU: 0B60 | Serial: F183JG3
-OS: Microsoft Windows 11 Pro | Version: 10.0.26100 | Build: 26100 | Arch: 64-bit
+[1] WMI repository verification
+WMI repository is consistent
 
---- Summary ---
+    WMI repository OK.
 
-Step                               Result Detail
-----                               ------ ------
-Manufacturer                       OK     Dell Inc.
-WMI Repository                     WARN   WMI repository ver...
-Dell Command | Monitor Installed   WARN   No uninstall entry...
-Dell Monitor Files                 WARN   No common Dell Com...
-root\\dcim children                OK     sysman
-DCIM classes in root\\dcim\\sysman FAIL   0 DCIM_* classes p...
-DCIM_NumericSensor                 FAIL   Not found in any c...
+[2] Dell Command | Monitor installation check
+    (Required for sensors. Dell Command | Update does NOT provide WMI/sensor support.)
+    Dell Command | Monitor is NOT installed (no uninstall entry, no common paths).
+    Required action: Install Dell Command | Monitor from Dell Support (product: Dell Command | Monitor).
+    Do not rely on Dell Command | Update for temperature/sensor telemetry.
 
+[3] DCIM_* classes in root\dcim\sysman
+    Zero DCIM_* classes in root\dcim\sysman.
+    This matches Dell Command | Monitor not being installed. Install DCM, then rerun this script.
 
-
---- DCIM Namespace Reports (top-level) ---
-
-Namespace        TotalClassCount DcimClassCount
----------        --------------- --------------
-root\dcim\sysman              65              0
-
-
-
---- Findings ---
-- Dell Command | Monitor does not appear installed AND no DCIM classes exist. Install Dell Command | Monitor on this endpoint, then re-run.
-- DCIM_NumericSensor was not found anywhere. Without it (or an equivalent Dell sensor class), you cannot retrieve temperatures via Dell-native WMI on this device.
-
---- Next steps (based on findings) ---
-- Dell Command | Monitor not detected: install it, then re-run this script.
-- WMI repository did not verify as consistent; investigate WMI health (verify/repair) before expecting 3rd-party providers to load.
-- If DCIM classes never appear after reinstall and WMI health is OK, this model/SKU likely does not expose temperature telemetry via Dell-native WMI.
-PS C:\Users\Dell Test - 1\Desktop>
+========== End remediation check ==========
+PS C:\WINDOWS\system32>
