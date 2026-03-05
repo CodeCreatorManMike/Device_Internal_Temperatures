@@ -1,20 +1,25 @@
 
+PS C:\Users\Dell Test - 1\Desktop> ./Get-DellThermals.ps1
+
 --- Dell temperature sensors (DCIM_NumericSensor, SensorType=2) ---
   Manufacturer: Dell Inc.  |  Namespace: root\dcim\sysman  |  DCIM_NumericSensor: False
 
   No temperature readings returned.
-  No DCIM_* classes in root\dcim\sysman. Dell Command | Monitor WMI provider not present or not exposing DCIM classes; no native Dell temps available on this device via WMI.
+  root\dcim\sysman exists but zero DCIM_* classes exist inside it. Dell Command | Monitor WMI provider not present / not registered; cannot access Dell-native temps.
 
 --- Discovery ---
 
 Step                Result        Detail
 ----                ------        ------
-Temperature sensors Not available No DCIM_* classes in root\dcim\sysman. Dell
-                                  Command | Monitor WMI provider not present or
-                                  not exposing DCIM classes; no native Dell temps
-                                  available on this device via WMI.
+Temperature sensors Not available root\dcim\sysman exists but zero DCIM_* classes exist inside it. Dell Command |
+                                  Monitor WMI provider not present / not registered; cannot access Dell-native temps.
 
 
+
+--- Remediation ---
+  a) Verify Dell Command | Monitor is installed (run this script with -Diagnostic, or check Uninstall registry).
+  b) If missing or broken: reinstall or repair Dell Command | Monitor from Dell support (product: Dell Command | Monitor).
+  c) After install/repair: rerun class discovery (e.g. .\Get-DellTemps.ps1 -Diagnostic).
 
 --- Unique sensors and mapping ---
 Component is inferred only when SensorName contains one of: CPU, GPU, Ambient, Memory, Storage, Chassis, VRM, Battery, Fan (case-insensitive). Otherwise Component = $null.
