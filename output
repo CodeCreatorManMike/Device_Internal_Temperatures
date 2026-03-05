@@ -1,3 +1,12 @@
 PS C:\Users\Dell Test - 1\Desktop> ./Get-DellTemps-AutoInstall.ps1
-ERROR: The property 'DisplayName' cannot be found on this object. Verify that the property exists.
+ERROR: Failed to download Dell Command | Monitor installer from: https://dl.dell.com/FOLDER14184140M/1/Dell-Command-Monitor_NP0X6_WIN64_10.13.0.96_A00.EXE
+
+--- Error report ---
+
+Step               ExceptionType           Message
+----               -------------           -------
+Download installer System.Net.WebException The remote server returned an error:
+                                           (403) Forbidden.
+
+
 PS C:\Users\Dell Test - 1\Desktop>
