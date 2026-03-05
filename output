@@ -16,7 +16,23 @@ DCIM_Temperature   Skip   Invalid class
 DCIM_SystemThermal Skip   Invalid class
 
 
+-------
 
 --- Unique sensors and mapping ---
 Component inferred only when SensorName contains CPU/GPU/Ambient/Memory/Storage/Chassis/VRM/Battery/Fan; otherwise null.
+PS C:\Users\Dell Test - 1\Desktop>
+
+
+S C:\Users\Dell Test - 1\Desktop> Get-CimClass -Namespace root\dcim\sysman | Where-Object CimClassName -match '^DCIM' | Select-Object -ExpandProperty CimClassName | Sort-Object
+PS C:\Users\Dell Test - 1\Desktop> PS C:\Users\Dell Test - 1\Desktop> Get-CimClass -Namespace root\dcim\sysman | Where-Object CimClassName -match '^DCIM' | Select-Object -ExpandProperty CimClassName | Sort-Object
+Get-Process : A positional parameter cannot be found that accepts argument 'Test'.
+At line:1 char:1
++ PS C:\Users\Dell Test - 1\Desktop> Get-CimClass -Namespace root\dcim\ ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : InvalidArgument: (:) [Get-Process], ParameterBinding
+   Exception
+    + FullyQualifiedErrorId : PositionalParameterNotFound,Microsoft.PowerShell.Com
+   mands.GetProcessCommand
+
+PS C:\Users\Dell Test - 1\Desktop>  Get-CimClass -Namespace root\dcim\sysman | Where-Object CimClassName -match '^DCIM' | Select-Object -ExpandProperty CimClassName | Sort-Object
 PS C:\Users\Dell Test - 1\Desktop>
