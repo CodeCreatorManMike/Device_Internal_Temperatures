@@ -17,6 +17,9 @@
 .PARAMETER OutFile
   When used with -AsJson, write JSON to this file path.
 
+.PARAMETER Diagnostic
+  Dump raw WMI and perf counter output (instance count, property names, first instance) so you can see exactly what this PC exposes.
+
 .EXAMPLE
   .\Get-MicrosoftThermals.ps1
 
@@ -27,7 +30,8 @@
 [CmdletBinding()]
 param(
   [switch]$AsJson,
-  [string]$OutFile
+  [string]$OutFile,
+  [switch]$Diagnostic
 )
 
 $ErrorActionPreference = 'Stop'
@@ -68,11 +72,17 @@ $now = (Get-Date).ToString("o")
 $computer = $env:COMPUTERNAME
 $results = New-Object System.Collections.Generic.List[object]
 
+# Track why each source produced no (or few) readings; shown when output is empty or -Diagnostic
+$diagWmiAcpi = $null
+$diagPerfTzi = $null
+
 # ========== 1) ACPI thermal zones via WMI (root/wmi) ==========
 # MSAcpi_ThermalZoneTemperature is the WMI representation of ACPI thermal zone
 # temperature. CurrentTemperature is in tenths of Kelvin when populated.
 try {
   $acpi = Get-CimInstance -Namespace "root/wmi" -ClassName "MSAcpi_ThermalZoneTemperature" -ErrorAction Stop
+  $acpiCount = @($acpi).Count
+  $added = 0
   foreach ($z in $acpi) {
     $raw = $null
     if ($z.PSObject.Properties.Name -contains "CurrentTemperature") {
@@ -92,9 +102,16 @@ try {
         InferredComponent = (Get-InferredComponent -ZoneName $zoneName)
         Notes             = "ACPI thermal zone via root/wmi MSAcpi_ThermalZoneTemperature"
       })
+      $added++
     }
   }
+  $diagWmiAcpi = if ($added -eq 0) {
+    "Query OK but no usable readings: $acpiCount instance(s); no CurrentTemperature or all null. (Dell/other OEMs often don't expose ACPI thermal zones.)"
+  } else {
+    "OK: $added reading(s) from $acpiCount instance(s)."
+  }
 } catch {
+  $diagWmiAcpi = "Error: $($_.Exception.Message)"
   # Device may not expose ACPI thermal zones, or WMI provider not available.
   $results.Add([pscustomobject]@{
     Timestamp         = $now
@@ -105,7 +122,7 @@ try {
     RawValue          = $null
     RawUnits          = $null
     InferredComponent = $null
-    Notes             = "Failed to read root/wmi MSAcpi_ThermalZoneTemperature: $($_.Exception.Message)"
+    Notes             = "Failed: $($_.Exception.Message)"
   })
 }
 
@@ -115,6 +132,8 @@ try {
 # tenths of Kelvin; we use whichever is available.
 try {
   $tzi = Get-CimInstance -ClassName "Win32_PerfFormattedData_Counters_ThermalZoneInformation" -ErrorAction Stop
+  $tziCount = @($tzi).Count
+  $added = 0
   foreach ($row in $tzi) {
     $raw = $null
     if ($row.PSObject.Properties.Name -contains "Temperature") {
@@ -139,6 +158,7 @@ try {
         InferredComponent = (Get-InferredComponent -ZoneName $zoneName)
         Notes             = "PerfFormattedData Counters_ThermalZoneInformation Temperature"
       })
+      $added++
     }
     if ($null -ne $hpt -and $hpt -ne 0) {
       $celsiusHpt = Convert-TenthsKelvinToCelsius -TenthsKelvin $hpt
@@ -153,9 +173,16 @@ try {
         InferredComponent = (Get-InferredComponent -ZoneName $zoneName)
         Notes             = "PerfFormattedData Counters_ThermalZoneInformation HighPrecisionTemperature"
       })
+      $added++
     }
   }
+  $diagPerfTzi = if ($added -eq 0) {
+    "Query OK but no usable readings: $tziCount instance(s); no Temperature/HighPrecisionTemperature or all zero. (Thermal Zone perf counters often absent on non-Surface OEMs.)"
+  } else {
+    "OK: $added reading(s) from $tziCount instance(s)."
+  }
 } catch {
+  $diagPerfTzi = "Error: $($_.Exception.Message)"
   $results.Add([pscustomobject]@{
     Timestamp         = $now
     ComputerName      = $computer
@@ -165,7 +192,7 @@ try {
     RawValue          = $null
     RawUnits          = $null
     InferredComponent = $null
-    Notes             = "Failed to read Win32_PerfFormattedData_Counters_ThermalZoneInformation: $($_.Exception.Message)"
+    Notes             = "Failed: $($_.Exception.Message)"
   })
 }
 
@@ -183,10 +210,13 @@ $summary = [pscustomobject]@{
 }
 
 # --- Output ---
+$hasUsableReadings = ($deduped | Where-Object { $null -ne $_.Celsius }).Count -gt 0
+
 if ($AsJson) {
   $output = @{
-    readings = @($deduped)
-    summary  = $summary
+    readings   = @($deduped)
+    summary    = $summary
+    diagnostic = @{ WMI_ACPI = $diagWmiAcpi; PERF_TZI = $diagPerfTzi }
   }
   $json = $output | ConvertTo-Json -Depth 6
   if ($OutFile) {
@@ -199,9 +229,52 @@ if ($AsJson) {
   Write-Host "`n--- Thermal zone readings ---" -ForegroundColor Cyan
   $deduped | Sort-Object Source, ZoneName | Format-Table -AutoSize Timestamp, ComputerName, Source, ZoneName, Celsius, RawValue, InferredComponent, Notes -Wrap
 
+  # Always show why each source did or didn't return data (so empty output is explained)
+  Write-Host "`n--- Why this result? (per-source) ---" -ForegroundColor Yellow
+  Write-Host "  WMI_ACPI (root/wmi MSAcpi_ThermalZoneTemperature): $diagWmiAcpi"
+  Write-Host "  PERF_TZI (Thermal Zone Information perf counters):  $diagPerfTzi"
+  if (-not $hasUsableReadings) {
+    Write-Host "`n  This PC does not expose thermal zones via these APIs (common on Dell/HP/Lenovo)." -ForegroundColor Gray
+    Write-Host "  Surface/Microsoft devices more often do. Use -Diagnostic to see raw WMI/perf output." -ForegroundColor Gray
+  }
+
   Write-Host "`n--- Summary: unique zones and mapping ---" -ForegroundColor Cyan
   $uniqueZones | Format-Table -AutoSize
   Write-Host $summary.MappingNote -ForegroundColor Gray
+}
+
+# ========== -Diagnostic: dump raw WMI and perf output ==========
+if ($Diagnostic) {
+  Write-Host "`n========== DIAGNOSTIC (raw data from this PC) ==========" -ForegroundColor Magenta
+  Write-Host "`n[1] root/wmi MSAcpi_ThermalZoneTemperature" -ForegroundColor Cyan
+  $rawAcpi = $null
+  try {
+    $rawAcpi = Get-CimInstance -Namespace "root/wmi" -ClassName "MSAcpi_ThermalZoneTemperature" -ErrorAction SilentlyContinue
+  } catch {}
+  if (-not $rawAcpi -or @($rawAcpi).Count -eq 0) {
+    Write-Host "  Instances: 0 (or class not available)"
+  } else {
+    $first = @($rawAcpi)[0]
+    Write-Host "  Instances: $(@($rawAcpi).Count)"
+    Write-Host "  Property names: $(($first.PSObject.Properties.Name) -join ', ')"
+    Write-Host "  First instance:"
+    $first.PSObject.Properties | ForEach-Object { Write-Host "    $($_.Name) = $($_.Value)" }
+  }
+  Write-Host "`n[2] Win32_PerfFormattedData_Counters_ThermalZoneInformation" -ForegroundColor Cyan
+  $rawTzi = $null
+  try {
+    $rawTzi = Get-CimInstance -ClassName "Win32_PerfFormattedData_Counters_ThermalZoneInformation" -ErrorAction SilentlyContinue
+  } catch {}
+  if (-not $rawTzi -or @($rawTzi).Count -eq 0) {
+    Write-Host "  Instances: 0 (or class not available)"
+  } else {
+    $first = @($rawTzi)[0]
+    Write-Host "  Instances: $(@($rawTzi).Count)"
+    Write-Host "  Property names: $(($first.PSObject.Properties.Name) -join ', ')"
+    Write-Host "  First instance:"
+    $first.PSObject.Properties | ForEach-Object { Write-Host "    $($_.Name) = $($_.Value)" }
+  }
+  Write-Host "`n========== END DIAGNOSTIC ==========" -ForegroundColor Magenta
 }
 
 # ========== Quick manual commands (for troubleshooting) ==========
