@@ -1,21 +1,22 @@
-PS C:\Users\Dell Test - 1\Desktop> ./Get-MicrosoftThermals.ps1
+PS C:\Users\Dell Test - 1\Desktop> ./Get-DellThermals.ps1
 
---- Thermal zone readings ---
+--- Dell thermal sensors ---
+  Manufacturer: Dell Inc.  |  Namespace: root\dcim\sysman  |  OK: True
 
-Timestamp                         ComputerName    Source   ZoneName Celsius RawValu
-                                                                            e
----------                         ------------    ------   -------- ------- -------
-2026-03-05T09:48:32.9538569+00:00 DESKTOP-OPCARCS WMI_ACPI
+  No temperature readings returned.
+  Ensure Dell Command | Monitor is installed. Run with -Diagnostic to list DCIM classes.
+
+--- Per-class status ---
+
+Step               Result Detail
+----               ------ ------
+Namespace          OK     root\dcim\sysman available.
+DCIM_ThermalSensor Skip   Invalid class
+DCIM_Temperature   Skip   Invalid class
+DCIM_SystemThermal Skip   Invalid class
 
 
 
---- Why this result? (per-source) ---
-  WMI_ACPI (root/wmi MSAcpi_ThermalZoneTemperature): Error: Not supported
-  PERF_TZI (Thermal Zone Information perf counters):  Query OK but no usable readings: 0 instance(s); no Temperature/HighPrecisionTemperature or all zero. (Thermal Zone perf counters often absent on non-Surface OEMs.)
-
-  This PC does not expose thermal zones via these APIs (common on Dell/HP/Lenovo).
-  Surface/Microsoft devices more often do. Use -Diagnostic to see raw WMI/perf output.
-
---- Summary: unique zones and mapping ---
-InferredComponent set only when ZoneName contains CPU/GFX/GPU/SKIN/BAT/CHG/PCH (or variants); otherwise null.
+--- Unique sensors and mapping ---
+Component inferred only when SensorName contains CPU/GPU/Ambient/Memory/Storage/Chassis/VRM/Battery/Fan; otherwise null.
 PS C:\Users\Dell Test - 1\Desktop>
