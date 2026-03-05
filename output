@@ -5,9 +5,16 @@ PS C:\Users\Dell Test - 1\Desktop> ./Get-MicrosoftThermals.ps1
 Timestamp                         ComputerName    Source   ZoneName Celsius RawValu
                                                                             e
 ---------                         ------------    ------   -------- ------- -------
-2026-03-05T09:39:57.0627121+00:00 DESKTOP-OPCARCS WMI_ACPI
+2026-03-05T09:48:32.9538569+00:00 DESKTOP-OPCARCS WMI_ACPI
 
 
+
+--- Why this result? (per-source) ---
+  WMI_ACPI (root/wmi MSAcpi_ThermalZoneTemperature): Error: Not supported
+  PERF_TZI (Thermal Zone Information perf counters):  Query OK but no usable readings: 0 instance(s); no Temperature/HighPrecisionTemperature or all zero. (Thermal Zone perf counters often absent on non-Surface OEMs.)
+
+  This PC does not expose thermal zones via these APIs (common on Dell/HP/Lenovo).
+  Surface/Microsoft devices more often do. Use -Diagnostic to see raw WMI/perf output.
 
 --- Summary: unique zones and mapping ---
 InferredComponent set only when ZoneName contains CPU/GFX/GPU/SKIN/BAT/CHG/PCH (or variants); otherwise null.
