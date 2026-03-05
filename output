@@ -18,4 +18,74 @@ WMI repository is consistent
     This matches Dell Command | Monitor not being installed. Install DCM, then rerun this script.
 
 ========== End remediation check ==========
-PS C:\WINDOWS\system32>
+PS C:\WINDOWS\system32> cd "$env:USERPROFILE\Desktop"
+PS C:\Users\Dell Test - 1\Desktop> .\Get-DellTemps.ps1
+.\Get-DellTemps.ps1 : The term '.\Get-DellTemps.ps1' is not recognized as the name
+of a cmdlet, function, script file, or operable program. Check the spelling of the
+name, or if a path was included, verify that the path is correct and try again.
+At line:1 char:1
++ .\Get-DellTemps.ps1
++ ~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (.\Get-DellTemps.ps1:String) [], Com
+   mandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+
+PS C:\Users\Dell Test - 1\Desktop> .\Get-DellThermals.ps1
+
+--- Dell temperature sensors (DCIM discovery) ---
+  Manufacturer: Dell Inc.  |  Namespace: root\dcim\sysman  |  DCIM_* classes: 0  |  Sensor candidates: 0
+
+  No temperature readings returned.
+  Dell provider not installed/registered. root\dcim\sysman exists but zero DCIM_* classes exist inside it (namespace stub without Dell provider). Next action: Install Dell Command | Monitor (from Dell Support). Do not use Dell Command | Update for sensors; it does not provide WMI/sensor support.
+
+--- Discovery ---
+
+Step                Result        Detail
+----                ------        ------
+Temperature sensors Not available Dell provider not installed/registered.
+                                  root\dcim\sysman exists but zero DCIM_* classes
+                                  exist inside it (namespace stub without Dell
+                                  provider). Next action: Install Dell Command |
+                                  Monitor (from Dell Support). Do not use Dell
+                                  Command | Update for sensors; it does not
+                                  provide WMI/sensor support.
+
+
+
+--- Remediation ---
+  a) Run as Admin: .\Repair-DellWmiAndDcm.ps1 (WMI repo + Dell Command | Monitor check).
+  b) Install Dell Command | Monitor from Dell Support (not Dell Command | Update; Update does not provide sensor/WMI support).
+  c) After install: rerun this script or .\Get-DellTemps.ps1 -Diagnostic to confirm DCIM_* classes.
+
+--- Unique sensors and mapping ---
+Component is inferred only when SensorName contains one of: CPU, GPU, Ambient, Memory, Storage, Chassis, VRM, Battery, Fan (case-insensitive). Otherwise Component = $null.
+PS C:\Users\Dell Test - 1\Desktop> .\Get-DellThermals.ps1
+
+--- Dell temperature sensors (DCIM discovery) ---
+  Manufacturer: Dell Inc.  |  Namespace: root\dcim\sysman  |  DCIM_* classes: 0  |  Sensor candidates: 0
+
+  No temperature readings returned.
+  Dell provider not installed/registered. root\dcim\sysman exists but zero DCIM_* classes exist inside it (namespace stub without Dell provider). Next action: Install Dell Command | Monitor (from Dell Support). Do not use Dell Command | Update for sensors; it does not provide WMI/sensor support.
+
+--- Discovery ---
+
+Step                Result        Detail
+----                ------        ------
+Temperature sensors Not available Dell provider not installed/registered.
+                                  root\dcim\sysman exists but zero DCIM_* classes
+                                  exist inside it (namespace stub without Dell
+                                  provider). Next action: Install Dell Command |
+                                  Monitor (from Dell Support). Do not use Dell
+                                  Command | Update for sensors; it does not
+                                  provide WMI/sensor support.
+
+
+
+--- Remediation ---
+  a) Run as Admin: .\Repair-DellWmiAndDcm.ps1 (WMI repo + Dell Command | Monitor check).
+  b) Install Dell Command | Monitor from Dell Support (not Dell Command | Update; Update does not provide sensor/WMI support).
+  c) After install: rerun this script or .\Get-DellTemps.ps1 -Diagnostic to confirm DCIM_* classes.
+
+--- Unique sensors and mapping ---
+Component is inferred only when SensorName contains one of: CPU, GPU, Ambient, Memory, Storage, Chassis, VRM, Battery, Fan (case-insensitive). Otherwise Component = $null.
+PS C:\Users\Dell Test - 1\Desktop> cd "$env:USERPROFILE\Desktop"
