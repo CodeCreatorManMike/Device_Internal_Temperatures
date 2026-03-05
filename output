@@ -1,0 +1,14 @@
+PS C:\Users\Dell Test - 1\Desktop> ./Get-MicrosoftThermals.ps1
+
+--- Thermal zone readings ---
+
+Timestamp                         ComputerName    Source   ZoneName Celsius RawValu
+                                                                            e
+---------                         ------------    ------   -------- ------- -------
+2026-03-05T09:39:57.0627121+00:00 DESKTOP-OPCARCS WMI_ACPI
+
+
+
+--- Summary: unique zones and mapping ---
+InferredComponent set only when ZoneName contains CPU/GFX/GPU/SKIN/BAT/CHG/PCH (or variants); otherwise null.
+PS C:\Users\Dell Test - 1\Desktop>
