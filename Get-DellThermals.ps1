@@ -1,235 +1,196 @@
 <#
 .SYNOPSIS
-  Collects hardware temperature readings from Dell laptops via Dell Command Monitor (DCIM) WMI.
+  Reports temperatures from Dell devices via Dell Command | Monitor (DCM) WMI — no third-party sensor libraries.
 
 .DESCRIPTION
-  Uses the Dell Command Monitor WMI namespace root\dcim\sysman. Enumerates thermal-related
-  classes (DCIM_ThermalSensor, DCIM_Temperature, DCIM_SystemThermal, etc.) and optionally
-  DCIM_Fan. Does not assume component names; infers component only when sensor name clearly
-  indicates it. Requires Dell Command | Monitor to be installed (not just the PowerShell
-  Provider, which is for BIOS configuration).
+  Temperature sensors are exposed by Dell's documented class:
+    root\dcim\sysman : DCIM_NumericSensor
+  - SensorType = 2 => Temperature (Dell reference guide)
+  - CurrentReading => current value
+  - Units: BaseUnits * 10^UnitModifier (Dell reference guide)
 
-  Supported models: Latitude, Precision, OptiPlex, XPS (model-dependent sensor set).
+  Does NOT use Win32_TemperatureProbe (SMBIOS; no real-time readings). Does NOT assume ACPI thermal zones on Dell.
+  First discovers namespaces and classes; if DCIM_NumericSensor is missing or no SensorType=2 instances exist,
+  prints a clear failure reason and discovery output for troubleshooting.
+
+  Not all Dell systems expose sensor classes; DCM targets enterprise clients (Latitude, Precision, OptiPlex, etc.).
 
 .PARAMETER AsJson
-  Emit output as JSON instead of a formatted table.
+  Emit output as JSON.
 
 .PARAMETER OutFile
-  When used with -AsJson, write JSON to this file path.
+  With -AsJson, write JSON to this file path.
 
 .PARAMETER Diagnostic
-  List DCIM thermal classes, enumerate namespace, and show raw first-instance data.
-
-.PARAMETER IncludeFan
-  Include DCIM_Fan instances in output (fan readings, not temperature).
+  Dump discovery: namespace class count, first 30 class names, root\dcim children, DCM install check, first sensor raw properties.
 
 .EXAMPLE
-  .\Get-DellThermals.ps1
+  .\Get-DellTemps.ps1
 
 .EXAMPLE
-  .\Get-DellThermals.ps1 -AsJson -OutFile .\dell-thermals.json
+  .\Get-DellTemps.ps1 -AsJson -OutFile .\dell-temps.json
 
 .EXAMPLE
-  .\Get-DellThermals.ps1 -Diagnostic
+  .\Get-DellTemps.ps1 -Diagnostic
 #>
 
 [CmdletBinding()]
 param(
   [switch]$AsJson,
   [string]$OutFile,
-  [switch]$Diagnostic,
-  [switch]$IncludeFan
+  [switch]$Diagnostic
 )
 
 $ErrorActionPreference = 'Stop'
-$DellNamespace = "root\dcim\sysman"
 
 # --- Helpers ---
 
-# Dell DCIM thermal sensors typically report CurrentReading in Celsius. Some WMI classes
-# use tenths of Kelvin; we convert to Celsius when RawValue looks like Kelvin (e.g. 3000+).
-function ConvertTo-CelsiusReading {
-  param(
-    [double]$RawValue,
-    [string]$UnitsHint = $null
-  )
-  if ($null -eq $RawValue) { return $null }
-  # If value looks like tenths of Kelvin (common 2500–3500 range), convert.
-  if ($UnitsHint -eq "tenthsKelvin" -or ($RawValue -gt 500 -and $RawValue -lt 4000)) {
-    return [Math]::Round(($RawValue / 10.0) - 273.15, 2)
-  }
-  return [Math]::Round([double]$RawValue, 2)
+# Dell reference: scale = BaseUnits * 10^UnitModifier
+function Get-ScaledValue {
+  param([object]$Reading, [object]$UnitModifier)
+  if ($null -eq $Reading) { return $null }
+  if ($null -eq $UnitModifier) { return [double]$Reading }
+  return [double]$Reading * [Math]::Pow(10, [double]$UnitModifier)
 }
 
-# Infer component only when sensor name clearly implies it (do not assume).
-$componentKeywords = @{
-  'CPU'     = @('CPU', 'PROC', 'CORE', 'PACKAGE', 'PROCESSOR')
-  'GPU'     = @('GPU', 'GFX', 'GRAPHICS', 'DISCRETE', 'DISPLAY')
-  'Ambient' = @('AMBIENT', 'INLET', 'INTAKE')
-  'Memory'  = @('MEMORY', 'DIMM', 'RAM')
-  'Storage' = @('STORAGE', 'SSD', 'NVME', 'DRIVE', 'DISK')
-  'Chassis' = @('CHASSIS', 'SYSTEM', 'BOARD', 'MOTHERBOARD')
-  'VRM'     = @('VRM', 'VOLTAGE', 'REGULATOR')
-  'Battery' = @('BATTERY', 'BAT', 'BATT')
-  'Fan'     = @('FAN', 'FAN ')
-  'Thermal' = @('THERMAL', 'THERMAL DIODE', 'DIODE')
-}
-
+# Component only when sensor name clearly contains one of these (case-insensitive); otherwise $null
+$componentKeywords = @(
+  'CPU', 'GPU', 'Ambient', 'Memory', 'Storage', 'Chassis', 'VRM', 'Battery', 'Fan'
+)
 function Get-InferredComponent {
   param([string]$SensorName)
   if ([string]::IsNullOrWhiteSpace($SensorName)) { return $null }
   $upper = $SensorName.ToUpperInvariant()
-  foreach ($key in $componentKeywords.Keys) {
-    foreach ($kw in $componentKeywords[$key]) {
-      if ($upper -like "*$kw*") { return $key }
-    }
+  foreach ($kw in $componentKeywords) {
+    if ($upper -like "*$($kw.ToUpperInvariant())*") { return $kw }
   }
   return $null
+}
+
+function Test-NamespaceExists {
+  param([string]$Namespace)
+  try {
+    $null = Get-CimClass -Namespace $Namespace -ClassName "__Namespace" -ErrorAction Stop
+    return $true
+  } catch {
+    return $false
+  }
 }
 
 $now = (Get-Date).ToString("o")
 $computer = $env:COMPUTERNAME
 $results = New-Object System.Collections.Generic.List[object]
-$diagnostics = New-Object System.Collections.Generic.List[object]
+$discovery = New-Object System.Collections.Generic.List[object]
 
-# ========== 1) Detect Dell ==========
-$manufacturer = $null
+# ========== 1) Manufacturer ==========
+$manufacturer = "Unknown"
 try {
   $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
   $manufacturer = $cs.Manufacturer
-} catch {
-  $manufacturer = "Unknown"
-}
-
+} catch {}
 $isDell = $manufacturer -match "Dell"
 if (-not $isDell) {
-  Write-Warning "Manufacturer is not Dell ($manufacturer). Dell Command Monitor (DCIM) is only available on Dell systems."
+  Write-Warning "Manufacturer is not Dell ($manufacturer). Dell Command | Monitor is only available on Dell systems."
 }
 
-# ========== 2) Check namespace root\dcim\sysman exists ==========
-$namespaceExists = $false
+# ========== 2) Discover Dell WMI namespaces ==========
+$dcimNamespaces = @()
 try {
-  $null = Get-CimInstance -Namespace $DellNamespace -ClassName DCIM_ThermalSensor -ErrorAction Stop
-  $namespaceExists = $true
+  $children = Get-CimInstance -Namespace "root\dcim" -ClassName "__Namespace" -ErrorAction Stop
+  $dcimNamespaces = @($children | Select-Object -ExpandProperty Name)
 } catch {
-  try {
-    $classes = Get-CimClass -Namespace $DellNamespace -ErrorAction Stop
-    $namespaceExists = $null -ne $classes -and @($classes).Count -gt 0
-  } catch {
-    $namespaceExists = $false
-  }
+  $discovery.Add([pscustomobject]@{ Step = "root\dcim"; Result = "Missing or error"; Detail = $_.Exception.Message })
 }
 
+if ($dcimNamespaces.Count -eq 0 -and $discovery.Count -eq 0) {
+  $discovery.Add([pscustomobject]@{ Step = "root\dcim"; Result = "No child namespaces"; Detail = "root\dcim has no __Namespace children or namespace does not exist." })
+}
+
+# Primary namespace Dell documents for sensors
+$ns = "root\dcim\sysman"
+$namespaceExists = Test-NamespaceExists -Namespace $ns
 if (-not $namespaceExists) {
-  Write-Warning "Dell Command Monitor namespace (root\dcim\sysman) not found. Install Dell Command | Monitor."
-  $diagnostics.Add([pscustomobject]@{ Step = "Namespace"; Result = "Missing"; Detail = "root\dcim\sysman not available. Install Dell Command | Monitor." })
-} else {
-  $diagnostics.Add([pscustomobject]@{ Step = "Namespace"; Result = "OK"; Detail = "root\dcim\sysman available." })
+  $discovery.Add([pscustomobject]@{ Step = "Namespace $ns"; Result = "Missing"; Detail = "Install Dell Command | Monitor (not the BIOS PowerShell Provider)." })
 }
 
-# ========== 3) Enumerate thermal-related classes and collect readings ==========
-# Known Dell DCIM thermal classes; we try each and add whatever the device exposes.
-$thermalClassNames = @(
-  "DCIM_ThermalSensor",
-  "DCIM_Temperature",
-  "DCIM_SystemThermal"
-)
-
-foreach ($className in $thermalClassNames) {
+# ========== 3) Discover classes in root\dcim\sysman ==========
+$allClassNames = @()
+$dcimClassNames = @()
+$numericSensorClassExists = $false
+if ($namespaceExists) {
   try {
-    $instances = Get-CimInstance -Namespace $DellNamespace -ClassName $className -ErrorAction Stop
-    $count = @($instances).Count
-    $added = 0
-    foreach ($obj in $instances) {
-      $sensorName = $null
-      $tempC = $null
-      $rawVal = $null
-      $status = $null
-      $health = $null
-
-      # Property names vary by class; ElementName / Name, CurrentReading / CurrentValue / Reading, etc.
-      if ($obj.PSObject.Properties.Name -contains "ElementName") { $sensorName = $obj.ElementName }
-      elseif ($obj.PSObject.Properties.Name -contains "Name") { $sensorName = $obj.Name }
-      elseif ($obj.PSObject.Properties.Name -contains "InstanceID") { $sensorName = $obj.InstanceID }
-
-      if ($obj.PSObject.Properties.Name -contains "CurrentReading") {
-        $rawVal = [double]$obj.CurrentReading
-        $tempC = ConvertTo-CelsiusReading -RawValue $rawVal
-      } elseif ($obj.PSObject.Properties.Name -contains "CurrentValue") {
-        $rawVal = [double]$obj.CurrentValue
-        $tempC = ConvertTo-CelsiusReading -RawValue $rawVal
-      } elseif ($obj.PSObject.Properties.Name -contains "Reading") {
-        $rawVal = [double]$obj.Reading
-        $tempC = ConvertTo-CelsiusReading -RawValue $rawVal
-      }
-
-      if ($obj.PSObject.Properties.Name -contains "Status") { $status = $obj.Status }
-      if ($obj.PSObject.Properties.Name -contains "HealthState") { $health = $obj.HealthState }
-
-      if ($null -ne $tempC -or $null -ne $sensorName) {
-        $results.Add([pscustomobject]@{
-          Timestamp         = $now
-          ComputerName      = $computer
-          Source            = $className
-          SensorName        = $sensorName
-          Component         = (Get-InferredComponent -SensorName $sensorName)
-          TemperatureC      = $tempC
-          RawValue          = $rawVal
-          Status            = $status
-          Health            = $health
-          Notes             = "Dell DCIM $className"
-        })
-        $added++
-      }
-    }
-    $diagnostics.Add([pscustomobject]@{ Step = $className; Result = "OK"; Detail = "$count instance(s), $added reading(s)." })
+    $allClasses = Get-CimClass -Namespace $ns -ErrorAction Stop
+    $allClassNames = @($allClasses | Select-Object -ExpandProperty CimClassName)
+    $dcimClassNames = @($allClassNames | Where-Object { $_ -like "DCIM_*" } | Sort-Object)
+    $numericSensorClassExists = $dcimClassNames -contains "DCIM_NumericSensor"
   } catch {
-    $diagnostics.Add([pscustomobject]@{ Step = $className; Result = "Skip"; Detail = $_.Exception.Message })
+    $discovery.Add([pscustomobject]@{ Step = "Get-CimClass $ns"; Result = "Error"; Detail = $_.Exception.Message })
   }
 }
 
-# ========== 4) Optional: DCIM_Fan (fan sensors; may include temp or speed) ==========
-if ($IncludeFan) {
+$failureMessage = "Dell Command | Monitor WMI provider not present or not exposing DCIM classes; no native Dell temps available on this device via WMI."
+if (-not $numericSensorClassExists) {
+  if ($dcimClassNames.Count -eq 0 -and $allClassNames.Count -eq 0) {
+    $failureMessage = "Namespace $ns has no classes (or namespace missing). " + $failureMessage
+  } elseif ($dcimClassNames.Count -eq 0) {
+    $failureMessage = "No DCIM_* classes in $ns. " + $failureMessage
+  } else {
+    $failureMessage = "DCIM_NumericSensor not found in $ns. " + $failureMessage
+  }
+  $discovery.Add([pscustomobject]@{ Step = "Temperature sensors"; Result = "Not available"; Detail = $failureMessage })
+}
+
+# ========== 4) Query DCIM_NumericSensor, filter SensorType eq 2 (Temperature) ==========
+$tempSensors = @()
+if ($numericSensorClassExists) {
   try {
-    $fans = Get-CimInstance -Namespace $DellNamespace -ClassName DCIM_Fan -ErrorAction Stop
-    foreach ($obj in $fans) {
-      $sensorName = $null
-      if ($obj.PSObject.Properties.Name -contains "ElementName") { $sensorName = $obj.ElementName }
-      elseif ($obj.PSObject.Properties.Name -contains "Name") { $sensorName = $obj.Name }
-      $speed = $null
-      if ($obj.PSObject.Properties.Name -contains "CurrentReading") { $speed = $obj.CurrentReading }
-      elseif ($obj.PSObject.Properties.Name -contains "DesiredSpeed") { $speed = $obj.DesiredSpeed }
-      $results.Add([pscustomobject]@{
-        Timestamp         = $now
-        ComputerName      = $computer
-        Source            = "DCIM_Fan"
-        SensorName        = $sensorName
-        Component         = "Fan"
-        TemperatureC     = $null
-        RawValue          = $speed
-        Status            = if ($obj.PSObject.Properties.Name -contains "Status") { $obj.Status } else { $null }
-        Health            = if ($obj.PSObject.Properties.Name -contains "HealthState") { $obj.HealthState } else { $null }
-        Notes             = "Dell DCIM Fan (speed or state)"
-      })
+    $sensors = Get-CimInstance -Namespace $ns -ClassName "DCIM_NumericSensor" -ErrorAction Stop
+    # Dell reference: SensorType 2 = Temperature
+    $tempSensors = @($sensors | Where-Object { $_.SensorType -eq 2 })
+    if ($tempSensors.Count -eq 0) {
+      $failureMessage = "DCIM_NumericSensor exists but no SensorType=2 (Temperature) instances. " + $failureMessage
+      $discovery.Add([pscustomobject]@{ Step = "DCIM_NumericSensor"; Result = "No temp instances"; Detail = "Class exists but no SensorType=2 (Temperature) instances. Other SensorTypes may be present." })
     }
-    $diagnostics.Add([pscustomobject]@{ Step = "DCIM_Fan"; Result = "OK"; Detail = "$(@($fans).Count) fan(s)." })
   } catch {
-    $diagnostics.Add([pscustomobject]@{ Step = "DCIM_Fan"; Result = "Skip"; Detail = $_.Exception.Message })
+    $discovery.Add([pscustomobject]@{ Step = "DCIM_NumericSensor"; Result = "Error"; Detail = $_.Exception.Message })
   }
 }
 
-# De-dupe by Source + SensorName + RawValue
-$deduped = $results | Sort-Object Source, SensorName, RawValue -Unique
-$uniqueSensors = $deduped | Where-Object { $null -ne $_.SensorName } | Select-Object -Property Source, SensorName, Component -Unique
+foreach ($s in $tempSensors) {
+  $sensorName = if ($s.PSObject.Properties.Name -contains "ElementName") { $s.ElementName }
+    elseif ($s.PSObject.Properties.Name -contains "Name") { $s.Name }
+    else { $s.DeviceID }
+  $raw = $s.CurrentReading
+  $scaled = Get-ScaledValue -Reading $raw -UnitModifier $s.UnitModifier
+  $celsius = if ($null -ne $scaled) { [Math]::Round([double]$scaled, 2) } else { $null }
+  $results.Add([pscustomobject]@{
+    Timestamp     = $now
+    ComputerName  = $computer
+    Namespace     = $ns
+    ClassName     = "DCIM_NumericSensor"
+    SensorName    = $sensorName
+    Component     = (Get-InferredComponent -SensorName $sensorName)
+    Celsius       = $celsius
+    RawReading    = $raw
+    BaseUnits      = $s.BaseUnits
+    UnitModifier   = $s.UnitModifier
+    CurrentState   = $s.CurrentState
+  })
+}
+
+$deduped = $results | Sort-Object SensorName, RawReading -Unique
+$uniqueSensors = $deduped | Where-Object { $null -ne $_.SensorName } | Select-Object -Property SensorName, Component -Unique
+$mappingLine = "Component is inferred only when SensorName contains one of: CPU, GPU, Ambient, Memory, Storage, Chassis, VRM, Battery, Fan (case-insensitive). Otherwise Component = `$null."
 $summary = [pscustomobject]@{
   Timestamp     = $now
   ComputerName  = $computer
   Manufacturer  = $manufacturer
   IsDell        = $isDell
-  NamespaceOK   = $namespaceExists
+  Namespace     = $ns
+  ClassUsed     = "DCIM_NumericSensor"
   TotalReadings = $deduped.Count
   UniqueSensors = @($uniqueSensors)
-  MappingNote   = "Component inferred only when SensorName contains CPU/GPU/Ambient/Memory/Storage/Chassis/VRM/Battery/Fan; otherwise null."
+  MappingNote   = $mappingLine
 }
 
 # --- Output ---
@@ -237,7 +198,8 @@ if ($AsJson) {
   $output = @{
     readings   = @($deduped)
     summary    = $summary
-    diagnostic = @($diagnostics)
+    discovery  = @($discovery)
+    dcimClasses = @($dcimClassNames)
   }
   $json = $output | ConvertTo-Json -Depth 6
   if ($OutFile) {
@@ -247,77 +209,90 @@ if ($AsJson) {
     $json
   }
 } else {
-  Write-Host "`n--- Dell thermal sensors ---" -ForegroundColor Cyan
-  Write-Host "  Manufacturer: $manufacturer  |  Namespace: $DellNamespace  |  OK: $namespaceExists"
+  Write-Host "`n--- Dell temperature sensors (DCIM_NumericSensor, SensorType=2) ---" -ForegroundColor Cyan
+  Write-Host "  Manufacturer: $manufacturer  |  Namespace: $ns  |  DCIM_NumericSensor: $numericSensorClassExists"
   Write-Host ""
 
   if ($deduped.Count -eq 0) {
     Write-Host "  No temperature readings returned." -ForegroundColor Yellow
-    Write-Host "  Ensure Dell Command | Monitor is installed. Run with -Diagnostic to list DCIM classes." -ForegroundColor Gray
+    Write-Host "  $failureMessage" -ForegroundColor Gray
+    Write-Host "`n--- Discovery ---" -ForegroundColor Yellow
+    $discovery | Format-Table -AutoSize Step, Result, Detail -Wrap
+    if ($dcimClassNames.Count -gt 0) {
+      Write-Host "  DCIM_* classes present in $ns :" -ForegroundColor Gray
+      $dcimClassNames | ForEach-Object { Write-Host "    $_" }
+    }
   } else {
-    $deduped | Sort-Object Source, SensorName | Format-Table -AutoSize Timestamp, ComputerName, Source, SensorName, Component, TemperatureC, RawValue, Status, Health -Wrap
+    $deduped | Sort-Object SensorName | Format-Table -AutoSize Timestamp, ComputerName, SensorName, Component, Celsius, RawReading, BaseUnits, UnitModifier, CurrentState -Wrap
+    Write-Host "`n--- Discovery / status ---" -ForegroundColor Yellow
+    $discovery | Format-Table -AutoSize Step, Result, Detail -Wrap
   }
-
-  Write-Host "`n--- Per-class status ---" -ForegroundColor Yellow
-  $diagnostics | Format-Table -AutoSize Step, Result, Detail -Wrap
 
   Write-Host "`n--- Unique sensors and mapping ---" -ForegroundColor Cyan
-  $uniqueSensors | Format-Table -AutoSize
-  Write-Host $summary.MappingNote -ForegroundColor Gray
+  if ($uniqueSensors) {
+    $uniqueSensors | Format-Table -AutoSize
+  }
+  Write-Host $mappingLine -ForegroundColor Gray
 }
 
-# ========== -Diagnostic: list thermal classes and show raw first instance ==========
+# ========== -Diagnostic ==========
 if ($Diagnostic) {
-  Write-Host "`n========== DIAGNOSTIC (Dell DCIM) ==========" -ForegroundColor Magenta
+  Write-Host "`n========== DIAGNOSTIC ==========" -ForegroundColor Magenta
   Write-Host "  Manufacturer: $manufacturer"
-  Write-Host "  Namespace: $DellNamespace"
   Write-Host ""
 
-  Write-Host "[1] CimClasses in namespace containing Therm or Temp:" -ForegroundColor Cyan
+  Write-Host "[1] Class count in root\dcim\sysman:" -ForegroundColor Cyan
   try {
-    $allClasses = Get-CimClass -Namespace $DellNamespace -ErrorAction Stop
-    $thermalClasses = $allClasses | Where-Object { $_.CimClassName -match "Therm|Temp|Fan" }
-    if ($thermalClasses) {
-      $thermalClasses | ForEach-Object { Write-Host "    $($_.CimClassName)" }
+    $count = (Get-CimClass -Namespace $ns -ErrorAction Stop | Measure-Object).Count
+    Write-Host "    Count = $count"
+  } catch {
+    Write-Host "    Error: $($_.Exception.Message)"
+  }
+
+  Write-Host "`n[2] First 30 class names in root\dcim\sysman:" -ForegroundColor Cyan
+  try {
+    Get-CimClass -Namespace $ns -ErrorAction Stop |
+      Select-Object -First 30 -ExpandProperty CimClassName |
+      ForEach-Object { Write-Host "    $_" }
+  } catch {
+    Write-Host "    Error: $($_.Exception.Message)"
+  }
+
+  Write-Host "`n[3] Namespaces under root\dcim:" -ForegroundColor Cyan
+  try {
+    Get-CimInstance -Namespace "root\dcim" -ClassName "__Namespace" -ErrorAction Stop |
+      Select-Object -ExpandProperty Name |
+      ForEach-Object { Write-Host "    $_" }
+  } catch {
+    Write-Host "    Error: $($_.Exception.Message)"
+  }
+
+  Write-Host "`n[4] Dell Command | Monitor install check (registry):" -ForegroundColor Cyan
+  try {
+    $uninst = @(Get-ItemProperty "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue)
+    $uninst64 = @(Get-ItemProperty "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue)
+    $found = @($uninst + $uninst64) | Where-Object { $_.DisplayName -match "Dell Command\s*\|\s*Monitor|Command Monitor" }
+    if ($found.Count -eq 0) {
+      Write-Host "    No Dell Command | Monitor found in Uninstall keys."
     } else {
-      Write-Host "    (none or namespace not available)"
+      $found | ForEach-Object { Write-Host "    $($_.DisplayName)  $($_.DisplayVersion)" }
     }
   } catch {
     Write-Host "    Error: $($_.Exception.Message)"
   }
 
-  Write-Host "`n[2] DCIM_ThermalSensor (first instance):" -ForegroundColor Cyan
-  try {
-    $one = Get-CimInstance -Namespace $DellNamespace -ClassName DCIM_ThermalSensor -ErrorAction Stop | Select-Object -First 1
-    if ($one) {
-      $one.PSObject.Properties | ForEach-Object { Write-Host "    $($_.Name) = $($_.Value)" }
-    } else {
-      Write-Host "    No instances."
-    }
-  } catch {
-    Write-Host "    Error: $($_.Exception.Message)"
+  Write-Host "`n[5] First temperature sensor (SensorType=2) raw properties:" -ForegroundColor Cyan
+  if ($tempSensors.Count -gt 0) {
+    $tempSensors | Select-Object -First 1 | Format-List *
+  } else {
+    Write-Host "    No temperature sensor instances to show."
   }
 
-  Write-Host "`n[3] DCIM_Temperature (first instance, if present):" -ForegroundColor Cyan
-  try {
-    $one = Get-CimInstance -Namespace $DellNamespace -ClassName DCIM_Temperature -ErrorAction Stop | Select-Object -First 1
-    if ($one) {
-      $one.PSObject.Properties | ForEach-Object { Write-Host "    $($_.Name) = $($_.Value)" }
-    } else {
-      Write-Host "    No instances."
-    }
-  } catch {
-    Write-Host "    Error: $($_.Exception.Message)"
-  }
-
-  Write-Host "`n========== END DIAGNOSTIC ==========" -ForegroundColor Magenta
+  Write-Host "========== END DIAGNOSTIC ==========" -ForegroundColor Magenta
 }
 
-# ========== Quick manual commands ==========
-# Check if Dell Command Monitor is available:
-#   Get-CimClass -Namespace root\dcim\sysman
-# List thermal-related classes:
-#   Get-CimClass -Namespace root\dcim\sysman | Where-Object { $_.CimClassName -match "Therm|Temp" }
-# Get thermal sensors:
-#   Get-CimInstance -Namespace root\dcim\sysman -ClassName DCIM_ThermalSensor
-#   Get-CimInstance -Namespace root\dcim\sysman -ClassName DCIM_Temperature
+# ---------- Quick manual commands ----------
+# List DCIM classes (paste only the command, not the PS prompt):
+#   Get-CimClass -Namespace root\dcim\sysman | Where-Object CimClassName -like "DCIM_*" | Select-Object -ExpandProperty CimClassName | Sort-Object
+# Confirm DCIM_NumericSensor and get temp sensors:
+#   Get-CimInstance -Namespace root\dcim\sysman -ClassName DCIM_NumericSensor | Where-Object SensorType -eq 2
