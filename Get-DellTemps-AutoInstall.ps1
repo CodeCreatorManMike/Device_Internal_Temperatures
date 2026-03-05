@@ -62,7 +62,7 @@ $DefaultWin64Sha256  = "66c1cf7b4f428e1c67e6dc075743bc893547099cecf3a481e634212a
 # Dell Command | Monitor supports unattended install via "/s"
 $SilentArgs = "/s"
 
-$ProviderWaitSeconds = 120
+$ProviderWaitSeconds = 180
 $PollIntervalSeconds = 3
 
 # -----------------------------
@@ -89,27 +89,58 @@ function Add-ScriptError {
   }) | Out-Null
 }
 
-function Find-DellCommandMonitor {
-  $uninstallKeys = @(
+function Has-Prop {
+  param($obj, [string]$prop)
+  if ($null -eq $obj) { return $false }
+  return $null -ne $obj.PSObject.Properties[$prop]
+}
+
+function Get-Prop {
+  param($obj, [string]$prop)
+  if (Has-Prop $obj $prop) { return $obj.$prop }
+  return $null
+}
+
+function Get-UninstallEntriesSafe {
+  $paths = @(
     "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
     "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
   )
-  $rawEntries = foreach ($k in $uninstallKeys) {
-    try { Get-ItemProperty $k -ErrorAction Stop } catch { $null }
+  $all = New-Object System.Collections.Generic.List[object]
+  foreach ($p in $paths) {
+    try {
+      $items = Get-ItemProperty $p -ErrorAction Stop
+      foreach ($i in @($items)) {
+        if ($null -ne $i) { $all.Add($i) }
+      }
+    } catch { }
   }
-  $entries = @($rawEntries | Where-Object { $_ -ne $null -and $_.DisplayName })
-  $monitor = @($entries | Where-Object {
+  $all | Where-Object { Has-Prop $_ "DisplayName" -and (Get-Prop $_ "DisplayName") }
+}
+
+function Find-DellCommandMonitor {
+  $entries = @(Get-UninstallEntriesSafe)
+  $hits = @($entries | Where-Object {
+    $dn = Get-Prop $_ "DisplayName"
+    $dn -and
     (
-      $_.DisplayName -match 'Dell Command\s*\|\s*Monitor' -or
-      $_.DisplayName -match 'Dell Command Monitor' -or
-      $_.DisplayName -match 'Command\s*\|\s*Monitor'
+      $dn -match 'Dell Command\s*\|\s*Monitor' -or
+      $dn -match 'Dell Command Monitor' -or
+      $dn -match 'Command\s*\|\s*Monitor'
     ) -and
-    ($_.DisplayName -notmatch 'Update') -and
-    ($_.DisplayName -notmatch 'Configure')
+    ($dn -notmatch 'Update') -and
+    ($dn -notmatch 'Configure')
   } | Select-Object -First 5 DisplayName, DisplayVersion, Publisher, InstallDate)
+  $paths = @(
+    "$env:ProgramFiles\Dell\Command Monitor",
+    "$env:ProgramFiles\Dell\CommandMonitor",
+    "${env:ProgramFiles(x86)}\Dell\Command Monitor",
+    "${env:ProgramFiles(x86)}\Dell\CommandMonitor"
+  ) | Where-Object { Test-Path $_ }
   return [pscustomobject]@{
-    Found = (@($monitor).Count -gt 0)
-    Hits  = @($monitor)
+    Found = (@($hits).Count -gt 0 -or @($paths).Count -gt 0)
+    Hits  = @($hits)
+    Paths = @($paths)
   }
 }
 
@@ -186,7 +217,10 @@ function Ensure-DellCommandMonitor {
 function Pick-SensorName {
   param($inst)
   foreach ($p in @("ElementName", "Name", "SensorName", "DeviceID", "InstanceName")) {
-    if ($inst.PSObject.Properties.Name -contains $p -and $null -ne $inst.$p) { return [string]$inst.$p }
+    if (Has-Prop $inst $p) {
+      $v = Get-Prop $inst $p
+      if ($v) { return [string]$v }
+    }
   }
   return $null
 }
@@ -194,8 +228,11 @@ function Pick-SensorName {
 function Extract-RawValue {
   param($inst)
   foreach ($prop in @("CurrentReading", "Temperature", "Reading", "CurrentValue", "CurrentTemperature")) {
-    if ($inst.PSObject.Properties.Name -contains $prop -and $null -ne $inst.$prop) {
-      return [pscustomobject]@{ Prop = $prop; Val = $inst.$prop }
+    if (Has-Prop $inst $prop) {
+      $v = Get-Prop $inst $prop
+      if ($null -ne $v) {
+        return [pscustomobject]@{ Prop = $prop; Val = $v }
+      }
     }
   }
   return $null
@@ -203,9 +240,12 @@ function Extract-RawValue {
 
 function Try-ConvertToCelsius {
   param([string]$PropUsed, $inst, [object]$raw)
-  if ($inst.PSObject.Properties.Name -contains "UnitModifier" -and $null -ne $inst.UnitModifier) {
-    $scaled = [double]$raw * [Math]::Pow(10, [double]$inst.UnitModifier)
-    return [pscustomobject]@{ Celsius = $scaled; Scaling = "BaseUnits * 10^UnitModifier" }
+  if (Has-Prop $inst "UnitModifier") {
+    $um = Get-Prop $inst "UnitModifier"
+    if ($null -ne $um) {
+      $scaled = [double]$raw * [Math]::Pow(10, [double]$um)
+      return [pscustomobject]@{ Celsius = $scaled; Scaling = "BaseUnits * 10^UnitModifier" }
+    }
   }
   if ($PropUsed -eq "CurrentTemperature") {
     $c = ([double]$raw / 10.0) - 273.15
@@ -308,8 +348,8 @@ foreach ($cls in $sensorCandidates) {
   if ($instances.Count -eq 0) { continue }
 
   foreach ($inst in $instances) {
-    if ($cls -eq "DCIM_NumericSensor" -and ($inst.PSObject.Properties.Name -contains "SensorType")) {
-      if ($inst.SensorType -ne 2) { continue }
+    if ($cls -eq "DCIM_NumericSensor" -and (Has-Prop $inst "SensorType")) {
+      if ((Get-Prop $inst "SensorType") -ne 2) { continue }
     }
     $raw = Extract-RawValue -inst $inst
     if (-not $raw) { continue }
@@ -317,7 +357,7 @@ foreach ($cls in $sensorCandidates) {
     $isTemp = $false
     if ($cls -match 'Temp|Therm|Thermal') { $isTemp = $true }
     elseif ($raw.Prop -eq "Temperature") { $isTemp = $true }
-    elseif (($inst.PSObject.Properties.Name -contains "SensorType") -and ($inst.SensorType -eq 2)) { $isTemp = $true }
+    elseif ((Has-Prop $inst "SensorType") -and (Get-Prop $inst "SensorType") -eq 2) { $isTemp = $true }
     if (-not $isTemp) { continue }
 
     $name = Pick-SensorName -inst $inst
