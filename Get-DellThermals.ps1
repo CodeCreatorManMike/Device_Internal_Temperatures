@@ -43,6 +43,20 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# --- Error reporting: collect failures so you can identify exactly why something failed ---
+$scriptErrors = New-Object System.Collections.Generic.List[object]
+
+function Add-ScriptError {
+  param([string]$Step, [System.Exception]$Exception)
+  if (-not $Exception) { return }
+  $scriptErrors.Add([pscustomobject]@{
+    Step          = $Step
+    ExceptionType = $Exception.GetType().FullName
+    Message       = $Exception.Message
+    FullMessage   = $Exception.ToString()
+  }) | Out-Null
+}
+
 # --- Helpers ---
 
 # Dell reference: scale = BaseUnits * 10^UnitModifier
@@ -87,7 +101,9 @@ $manufacturer = "Unknown"
 try {
   $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
   $manufacturer = $cs.Manufacturer
-} catch {}
+} catch {
+  Add-ScriptError -Step "Win32_ComputerSystem (manufacturer)" -Exception $_.Exception
+}
 $isDell = $manufacturer -match "Dell"
 if (-not $isDell) {
   Write-Warning "Manufacturer is not Dell ($manufacturer). Dell Command | Monitor is only available on Dell systems."
@@ -99,6 +115,7 @@ try {
   $children = Get-CimInstance -Namespace "root\dcim" -ClassName "__Namespace" -ErrorAction Stop
   $dcimNamespaces = @($children | Select-Object -ExpandProperty Name)
 } catch {
+  Add-ScriptError -Step "root\dcim __Namespace" -Exception $_.Exception
   $discovery.Add([pscustomobject]@{ Step = "root\dcim"; Result = "Missing or error"; Detail = $_.Exception.Message })
 }
 
@@ -124,16 +141,19 @@ if ($namespaceExists) {
     $dcimClassNames = @($allClassNames | Where-Object { $_ -like "DCIM_*" } | Sort-Object)
     $numericSensorClassExists = $dcimClassNames -contains "DCIM_NumericSensor"
   } catch {
+    Add-ScriptError -Step "Get-CimClass $ns" -Exception $_.Exception
     $discovery.Add([pscustomobject]@{ Step = "Get-CimClass $ns"; Result = "Error"; Detail = $_.Exception.Message })
   }
 }
 
-$failureMessage = "Dell Command | Monitor WMI provider not present or not exposing DCIM classes; no native Dell temps available on this device via WMI."
+# Deterministic failure when provider not present / not registered (zero DCIM_* classes)
+$failureMessage = "Dell Command | Monitor WMI provider not present / not registered; cannot access Dell-native temps."
+$zeroDcimClasses = ($dcimClassNames.Count -eq 0)
 if (-not $numericSensorClassExists) {
-  if ($dcimClassNames.Count -eq 0 -and $allClassNames.Count -eq 0) {
+  if (-not $namespaceExists -or ($allClassNames.Count -eq 0)) {
     $failureMessage = "Namespace $ns has no classes (or namespace missing). " + $failureMessage
-  } elseif ($dcimClassNames.Count -eq 0) {
-    $failureMessage = "No DCIM_* classes in $ns. " + $failureMessage
+  } elseif ($zeroDcimClasses) {
+    $failureMessage = "root\dcim\sysman exists but zero DCIM_* classes exist inside it. " + $failureMessage
   } else {
     $failureMessage = "DCIM_NumericSensor not found in $ns. " + $failureMessage
   }
@@ -152,6 +172,7 @@ if ($numericSensorClassExists) {
       $discovery.Add([pscustomobject]@{ Step = "DCIM_NumericSensor"; Result = "No temp instances"; Detail = "Class exists but no SensorType=2 (Temperature) instances. Other SensorTypes may be present." })
     }
   } catch {
+    Add-ScriptError -Step "DCIM_NumericSensor (Get-CimInstance)" -Exception $_.Exception
     $discovery.Add([pscustomobject]@{ Step = "DCIM_NumericSensor"; Result = "Error"; Detail = $_.Exception.Message })
   }
 }
@@ -195,16 +216,34 @@ $summary = [pscustomobject]@{
 
 # --- Output ---
 if ($AsJson) {
+  $remediation = @()
+  $failureReason = $null
+  if ($deduped.Count -eq 0 -and ($zeroDcimClasses -or -not $numericSensorClassExists)) {
+    $failureReason = $failureMessage
+    $remediation = @(
+      "a) Verify Dell Command | Monitor is installed (run script with -Diagnostic or check Uninstall registry).",
+      "b) If missing or broken: reinstall or repair Dell Command | Monitor from Dell support (product: Dell Command | Monitor).",
+      "c) After install/repair: rerun class discovery (e.g. .\Get-DellTemps.ps1 -Diagnostic)."
+    )
+  }
   $output = @{
-    readings   = @($deduped)
-    summary    = $summary
-    discovery  = @($discovery)
-    dcimClasses = @($dcimClassNames)
+    readings     = @($deduped)
+    summary      = $summary
+    discovery    = @($discovery)
+    dcimClasses  = @($dcimClassNames)
+    failureReason = $failureReason
+    remediation  = @($remediation)
+    errors       = @($scriptErrors)
   }
   $json = $output | ConvertTo-Json -Depth 6
   if ($OutFile) {
-    $json | Out-File -FilePath $OutFile -Encoding utf8
-    Write-Host "JSON written to: $OutFile"
+    try {
+      $json | Out-File -FilePath $OutFile -Encoding utf8
+      Write-Host "JSON written to: $OutFile"
+    } catch {
+      Add-ScriptError -Step "Out-File $OutFile" -Exception $_.Exception
+      Write-Warning "Failed to write $OutFile : $($_.Exception.Message)"
+    }
   } else {
     $json
   }
@@ -216,14 +255,28 @@ if ($AsJson) {
   if ($deduped.Count -eq 0) {
     Write-Host "  No temperature readings returned." -ForegroundColor Yellow
     Write-Host "  $failureMessage" -ForegroundColor Gray
+    if ($scriptErrors.Count -gt 0) {
+      Write-Host "`n--- Error report ---" -ForegroundColor Red
+      $scriptErrors | Format-Table -AutoSize Step, ExceptionType, Message -Wrap
+    }
     Write-Host "`n--- Discovery ---" -ForegroundColor Yellow
     $discovery | Format-Table -AutoSize Step, Result, Detail -Wrap
     if ($dcimClassNames.Count -gt 0) {
       Write-Host "  DCIM_* classes present in $ns :" -ForegroundColor Gray
       $dcimClassNames | ForEach-Object { Write-Host "    $_" }
     }
+    if ($zeroDcimClasses -or -not $numericSensorClassExists) {
+      Write-Host "`n--- Remediation ---" -ForegroundColor Yellow
+      Write-Host "  a) Verify Dell Command | Monitor is installed (run this script with -Diagnostic, or check Uninstall registry)." -ForegroundColor Gray
+      Write-Host "  b) If missing or broken: reinstall or repair Dell Command | Monitor from Dell support (product: Dell Command | Monitor)." -ForegroundColor Gray
+      Write-Host "  c) After install/repair: rerun class discovery (e.g. .\Get-DellTemps.ps1 -Diagnostic)." -ForegroundColor Gray
+    }
   } else {
     $deduped | Sort-Object SensorName | Format-Table -AutoSize Timestamp, ComputerName, SensorName, Component, Celsius, RawReading, BaseUnits, UnitModifier, CurrentState -Wrap
+    if ($scriptErrors.Count -gt 0) {
+      Write-Host "`n--- Error report ---" -ForegroundColor Red
+      $scriptErrors | Format-Table -AutoSize Step, ExceptionType, Message -Wrap
+    }
     Write-Host "`n--- Discovery / status ---" -ForegroundColor Yellow
     $discovery | Format-Table -AutoSize Step, Result, Detail -Wrap
   }
@@ -241,28 +294,43 @@ if ($Diagnostic) {
   Write-Host "  Manufacturer: $manufacturer"
   Write-Host ""
 
-  Write-Host "[1] Class count in root\dcim\sysman:" -ForegroundColor Cyan
+  Write-Host "[1] Namespaces under root\dcim:" -ForegroundColor Cyan
+  $diagNsList = @()
   try {
-    $count = (Get-CimClass -Namespace $ns -ErrorAction Stop | Measure-Object).Count
-    Write-Host "    Count = $count"
+    $diagNsList = @(Get-CimInstance -Namespace "root\dcim" -ClassName "__Namespace" -ErrorAction Stop | Select-Object -ExpandProperty Name)
+    if ($diagNsList.Count -eq 0) {
+      Write-Host "    (none or root\dcim does not exist)"
+    } else {
+      $diagNsList | ForEach-Object { Write-Host "    $_" }
+    }
   } catch {
     Write-Host "    Error: $($_.Exception.Message)"
   }
 
-  Write-Host "`n[2] First 30 class names in root\dcim\sysman:" -ForegroundColor Cyan
-  try {
-    Get-CimClass -Namespace $ns -ErrorAction Stop |
-      Select-Object -First 30 -ExpandProperty CimClassName |
-      ForEach-Object { Write-Host "    $_" }
-  } catch {
-    Write-Host "    Error: $($_.Exception.Message)"
+  Write-Host "`n[2] Class count per namespace:" -ForegroundColor Cyan
+  $namespacesToCheck = @($ns)
+  if ($diagNsList.Count -gt 0) {
+    $namespacesToCheck = @($diagNsList | ForEach-Object { "root\dcim\$_" })
+  }
+  foreach ($dn in $namespacesToCheck) {
+    try {
+      $classes = @(Get-CimClass -Namespace $dn -ErrorAction Stop)
+      $count = $classes.Count
+      $dcimCount = ($classes | Where-Object { $_.CimClassName -like "DCIM_*" }).Count
+      Write-Host "    $dn : $count classes ($dcimCount DCIM_*)"
+    } catch {
+      Write-Host "    $dn : Error - $($_.Exception.Message)"
+    }
   }
 
-  Write-Host "`n[3] Namespaces under root\dcim:" -ForegroundColor Cyan
+  Write-Host "`n[3] First 30 class names in root\dcim\sysman:" -ForegroundColor Cyan
   try {
-    Get-CimInstance -Namespace "root\dcim" -ClassName "__Namespace" -ErrorAction Stop |
-      Select-Object -ExpandProperty Name |
-      ForEach-Object { Write-Host "    $_" }
+    $topClasses = @(Get-CimClass -Namespace $ns -ErrorAction Stop | Select-Object -First 30 -ExpandProperty CimClassName)
+    if ($topClasses.Count -eq 0) {
+      Write-Host "    (no classes)"
+    } else {
+      $topClasses | ForEach-Object { Write-Host "    $_" }
+    }
   } catch {
     Write-Host "    Error: $($_.Exception.Message)"
   }
@@ -288,7 +356,19 @@ if ($Diagnostic) {
     Write-Host "    No temperature sensor instances to show."
   }
 
-  Write-Host "========== END DIAGNOSTIC ==========" -ForegroundColor Magenta
+  if ($scriptErrors.Count -gt 0) {
+    Write-Host "`n[6] Error report (exceptions captured this run):" -ForegroundColor Cyan
+    $scriptErrors | Format-Table -AutoSize Step, ExceptionType, Message -Wrap
+    Write-Host "    FullMessage per error:" -ForegroundColor Gray
+    foreach ($e in $scriptErrors) {
+      Write-Host "    --- $($e.Step) ---" -ForegroundColor Gray
+      Write-Host "    $($e.FullMessage)" -ForegroundColor Gray
+    }
+  }
+  if ($zeroDcimClasses) {
+    Write-Host "`n  >> root\dcim\sysman has zero DCIM_* classes. Run remediation: verify DCM installed, reinstall/repair if needed, then rerun -Diagnostic." -ForegroundColor Yellow
+  }
+  Write-Host "`n========== END DIAGNOSTIC ==========" -ForegroundColor Magenta
 }
 
 # ---------- Quick manual commands ----------
