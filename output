@@ -1,12 +1,143 @@
-PS C:\Users\Dell Test - 1\Desktop> ./Get-DellTemps-AutoInstall.ps1
-ERROR: Failed to download Dell Command | Monitor installer from: https://dl.dell.com/FOLDER14184140M/1/Dell-Command-Monitor_NP0X6_WIN64_10.13.0.96_A00.EXE
+Mapping ACPI Thermal Zones to Physical Sensors on Modern Microsoft Surface Devices
+Executive summary
+A truly definitive, SKU-by-SKU mapping of Windows-visible ACPI Thermal Zone instance IDs (for example, TZ01_0, TZ02_0) to physical sensors (CPU/GPU/battery/skin/charger/etc.) is only possible when the firmware’s ACPI tables contain unambiguous identifiers (for example, an ACPI _STR description such as “Primary Battery” or “GPU”) and when those ThermalZone objects can be independently tied to a known sensor interface. In practice, Microsoft Surface firmware varies significantly by generation and platform:
 
---- Error report ---
+Some Surface devices expose ThermalZone objects whose _STR fields are human-readable sensor labels like “Primary Battery”, “GPU”, “SSD Temp”, “SOC Temp”, and “Tskin …”. This enables high-confidence mappings directly from the disassembled ACPI tables. A clear example is Surface Pro 7, whose DSDT contains several ThermalZone objects with descriptive _STR values. 
 
-Step               ExceptionType           Message
-----               -------------           -------
-Download installer System.Net.WebException The remote server returned an error:
-                                           (403) Forbidden.
+Other Surface devices expose ThermalZone objects whose _STR values are opaque codes such as RTS1…RTS8 and VTS1…VTS3 (observed on Surface Pro 8). Without additional proprietary documentation or measurement correlation, these cannot be mapped conclusively to “CPU vs skin vs charger” at the per-zone level. 
 
+Microsoft Surface devices also increasingly rely on the Surface System Aggregator Module (SSAM) / embedded controller. Linux gained a dedicated driver (surface_temp) to read out temperature probes connected via the Surface Aggregator Module, reinforcing that many Surface temperature channels are EC/SSAM-backed rather than “classic” ACPI-only sensors. 
 
-PS C:\Users\Dell Test - 1\Desktop>
+This report provides:
+
+A device-by-device, evidence-backed mapping where the ACPI tables are explicit (high confidence).
+A device-by-device identification of where the ThermalZone objects exist and what they are called when the firmware uses opaque naming, along with exactly what additional data is needed to complete the mapping.
+Scope note: Microsoft Surface is a large family (2016–2026 includes dozens of models and multiple CPU-platform variants). The most comprehensive public, primary dataset of Surface ACPI tables I found is the linux-surface acpidumps repository, which contains ACPI table disassemblies for many Surface devices and variants (Intel vs AMD vs Qualcomm). 
+
+How the mappings were derived and how to reproduce them
+Research workflow and provenance
+mermaid
+Copy
+flowchart TD
+  A[Enumerate Microsoft devices in-scope (2016+)] --> B[Locate primary ACPI table sources per device]
+  B --> C[Extract ThermalZone objects and identifiers\n(TZxx, _STR, _HID, _UID, _TMP call path)]
+  C --> D{Are _STR names descriptive?}
+  D -->|Yes| E[Map to physical sensor category\n(CPU/SOC, GPU, battery, skin, storage, board)]
+  D -->|No (opaque codes)| F[Mark as unresolved\nCollect next-best evidence:\nSSAM/EC driver docs, requests list, issue threads]
+  E --> G[Assign confidence & justification]
+  F --> H[Specify required additional data\n(measurement correlation or driver reverse engineering)]
+  G --> I[Device-by-device tables + comparative analysis]
+  H --> I
+Primary evidence is taken from disassembled ACPI tables (DSDT/SSDT) in linux-surface/acpidumps (firmware-derived). 
+
+Interpretation is augmented by Linux kernel Surface Aggregator documentation and the surface_temp driver patchset, which explicitly targets thermal sensors routed through the Surface Aggregator Module. 
+
+Where naming is opaque, the linux-surface community explicitly notes that newer generations may require Windows driver reverse engineering or other mapping discovery beyond ACPI strings. 
+
+ACPI evidence types used in this report
+ACPI/DSDT/SSDT excerpt (primary): A ThermalZone object (e.g., ThermalZone (TZ07)) with _STR and _TMP is direct evidence of what the firmware calls the thermal channel and how temperature is obtained. (Example: Surface Pro 7 DSDT zone list.) 
+
+Kernel driver mapping (primary/secondary): The Linux surface_temp driver and Surface Aggregator documentation describe how Surface devices expose thermal sensors via SSAM/EC. This supports interpreting _TMP calls that appear to be SAM/SSAM-backed. 
+
+Community reverse-engineering status (supporting): The surface-aggregator-module issue discussion explains that on some newer devices thermal ID strings are not easily mapped and may be encoded in Windows drivers. 
+
+Definitive per-device mappings from ACPI ThermalZone definitions
+The table below is device-by-device and only includes entries where the ACPI tables provide enough information to map to a physical sensor class with high confidence.
+
+Comparative table of mapped devices and ACPI thermal zones
+Device (model)	Variants / SKUs covered by evidence	ACPI thermal zones present	Mapped physical sensor type	Evidence type	Confidence & justification
+Surface Pro 7	ACPI dump represents at least one Pro 7 unit; Microsoft service docs show Pro 7 is a defined model family (consumer/commercial may share firmware line). 
+TZ01–TZ09 (as defined in DSDT; Windows commonly shows these as TZ01_0 etc as instance IDs)	TZ01–TZ04: motherboard/board sensors (“Primary Motherboard 1–4”); TZ05: battery (“Primary Battery”); TZ06: GPU (“GPU”); TZ07: storage (“SSD Temp”); TZ08: SoC/CPU package (“SOC Temp”); TZ09: skin/hotspot (“Tskin HS1”)	ACPI DSDT excerpt showing ThermalZone objects and _STR sensor labels	High: _STR strings are directly descriptive (“Primary Battery”, “GPU”, “SSD Temp”, “SOC Temp”, “Tskin…”) and are embedded in the ThermalZone objects. 
+Surface Book 2	Detachable “Base” architecture; mapping applies to the ACPI dump’s firmware set	TZ01–TZ08 (in DSDT under Surface Aggregator scope)	TZ01–TZ04: skin sensors (“SKIN0”–“SKIN3”); TZ05: tablet/top battery (“Top Battery”); TZ06: discrete GPU (“dGPU”); TZ07: base motherboard (“Base MB”); TZ08: base battery (“Base battery”)	ACPI DSDT excerpt showing ThermalZone objects and _STR labels	High for category mapping because _STR encodes “SKIN…”, “dGPU”, “Base MB”, “Base battery” explicitly. 
+
+Surface Pro 7 detailed mapping
+ACPI ThermalZone objects found: TZ01–TZ09. 
+
+Interpreting Windows names: on Windows these typically appear as ACPI Thermal Zone devices with instance suffixes (e.g., TZ01_0), but the authoritative identity is the ACPI namespace object name TZ01, TZ02, etc. (The Windows-specific rendering is not a stable hardware truth; the ACPI object is.) 
+
+Mapping table (Surface Pro 7)
+
+ACPI ThermalZone (ACPI object)	Windows-style instance ID	_STR description in ACPI	Mapped physical sensor	Evidence	Confidence
+TZ01	TZ01_0	“Primary Motherboard 1”	Motherboard / internal board sensor	DSDT ThermalZone _STR	High 
+TZ02	TZ02_0	“Primary Motherboard 2”	Motherboard / internal board sensor	DSDT ThermalZone _STR	High 
+TZ03	TZ03_0	“Primary Motherboard 3”	Motherboard / internal board sensor	DSDT ThermalZone _STR	High 
+TZ04	TZ04_0	“Primary Motherboard 4”	Motherboard / internal board sensor	DSDT ThermalZone _STR	High 
+TZ05	TZ05_0	“Primary Battery”	Battery temperature	DSDT ThermalZone _STR	High 
+TZ06	TZ06_0	“GPU”	GPU temperature	DSDT ThermalZone _STR	High 
+TZ07	TZ07_0	“SSD Temp”	SSD / storage temperature	DSDT ThermalZone _STR	High 
+TZ08	TZ08_0	“SOC Temp”	SoC / CPU package temperature	DSDT ThermalZone _STR	High 
+TZ09	TZ09_0	“Tskin HS1”	Skin / hotspot temperature	DSDT ThermalZone _STR	High 
+
+Why this is high confidence: the mapping does not rely on heuristics like “TZ00 is CPU”; it uses explicit _STR labels that name the monitored part (Battery / GPU / SSD / SOC / Tskin). 
+
+Surface Book 2 detailed mapping
+ACPI ThermalZone objects found: TZ01–TZ08. 
+
+These zones are firmware-exposed temperature channels that appear to be mediated by the Surface Aggregator (consistent with the broader SSAM thermal sensor architecture described in the Linux driver work). 
+
+Mapping table (Surface Book 2)
+
+ACPI ThermalZone	Windows-style instance ID	_STR description in ACPI	Mapped physical sensor	Evidence	Confidence
+TZ01	TZ01_0	“SKIN0”	Skin sensor	DSDT ThermalZone _STR	High 
+TZ02	TZ02_0	“SKIN1”	Skin sensor	DSDT ThermalZone _STR	High 
+TZ03	TZ03_0	“SKIN2”	Skin sensor	DSDT ThermalZone _STR	High 
+TZ04	TZ04_0	“SKIN3”	Skin sensor	DSDT ThermalZone _STR	High 
+TZ05	TZ05_0	“Top Battery”	Tablet/top battery temperature	DSDT ThermalZone _STR	High 
+TZ06	TZ06_0	“dGPU”	Discrete GPU temperature (base GPU)	DSDT ThermalZone _STR	High 
+TZ07	TZ07_0	“Base MB”	Base motherboard temperature	DSDT ThermalZone _STR	High 
+TZ08	TZ08_0	“Base battery”	Base battery temperature	DSDT ThermalZone _STR	High 
+
+Devices with ACPI thermal zones present but not conclusively mappable from public primary sources
+This section lists modern Microsoft devices where ACPI ThermalZone objects are clearly defined, but the zone-to-physical-sensor mapping is not derivable to your requested granularity because identifiers are opaque and Microsoft does not publish a complete mapping.
+
+Surface Pro 8
+Where the thermal zones are defined: in a Microsoft OEM SSDT (OEM Table ID "SsdtSurf"). 
+
+ACPI ThermalZone objects found: TZ01–TZ08 plus TZ09, TZ0A, TZ0B where _STR values are RTS1…RTS8 and VTS1…VTS3. 
+
+What can be stated definitively (and what cannot):
+
+Definitive: the firmware exposes multiple thermal zones and names them (for humans/OS) with short codes RTS* and VTS*. 
+Not definitive from public ACPI alone: whether RTS1 is CPU, GPU, battery, skin, charger, etc.
+This uncertainty is consistent with linux-surface’s own assessment: for newer generations, the older approach of “ID strings embedded in ACPI indicate what it is used for” may not hold, and mapping might require reverse engineering the Windows driver or other additional data. 
+
+Provisional classification (not the “definitive mapping” you requested):
+
+RTS* and VTS* are likely internal temperature probes used by the Surface thermal/telemetry stack, but categorising them as CPU vs skin vs charger without further evidence would be speculative. 
+Additional data required to complete a definitive mapping:
+
+A Windows-side trace or reverse engineering result showing which physical component each RTS* / VTS* corresponds to (linux-surface explicitly flags this possibility). 
+Empirical correlation: controlled workload tests (CPU-only, GPU-only, charging-only, SSD stress) while logging zone temperatures to see which channels respond, combined with physical probing (IR camera/thermocouples). This would constitute “measurement” evidence.
+Cross-correlation with SSAM thermal sensor names returned via the surface_temp interface (Linux), if the returned labels are more descriptive than ACPI _STR. The existence of a dedicated surface_temp driver indicates that such sensor enumeration and naming exists in the SSAM protocol. 
+Full model inventory and what is still needed for a complete 2016–2026 device-by-device mapping
+Inventory of Microsoft devices with public ACPI dumps in scope
+The linux-surface acpidumps repository enumerates ACPI table sets for many Microsoft devices and variants, including (among others) Surface Book/Go/Laptop/Pro lines and Windows Dev Kit 2023. 
+
+From the repository listing visible via GitHub, the following modern device directories (among others) exist and are relevant to your requested “since 2016” scope (some pre-2016 directories also exist): Surface Book 2/3; Surface Go 1–4; Surface Laptop 1–6 and Laptop 7 (Qualcomm); Surface Laptop Go 1–3; Surface Laptop SE; Surface Laptop Studio 1–2; Surface Pro 5–9 plus Pro X variants; Surface Studio 2; Windows Dev Kit 2023. 
+
+Why “all devices since 2016” is not yet fully satisfiable from public primary sources alone
+Even with ACPI table disassemblies available, not all firmware encodes sensor identity in human-readable form. The Surface ecosystem increasingly routes thermal sensing through the Surface Aggregator Module (SSAM). Linux-side work explicitly targets these “newer Surface devices” and treats thermal sensors as a SAM/EC subsystem. 
+
+Furthermore, the linux-surface community explicitly notes that on newer generations the “ID string embedded in ACPI” approach may not be present and that mappings could be encoded in Windows drivers, implying that ACPI-only extraction may be insufficient. 
+
+Where to obtain ACPI/DSDT/firmware for devices not conclusively mapped here
+If you need a definitive mapping for each model and SKU, for each target device you will typically need:
+
+ACPI tables from the device (primary)
+
+Linux runtime tables: /sys/firmware/acpi/tables/ (includes DSDT and SSDT*), or an ACPI table dump via acpidump. (These are standard kernel/OS mechanisms; the exact method depends on OS and privileges.)
+Public community collection: the linux-surface/acpidumps repository contains a large set of device-specific dumps and is the best single known public index for Surface ACPI tables. 
+Surface Aggregator / SSAM thermal sensor interface (primary-to-secondary)
+
+Linux kernel Surface Aggregator documentation describes the client/driver model and provides context for how Surface EC-exposed subsystems (including thermal) are addressed. 
+The surface_temp driver (and its patch history) documents that thermal probes exist behind SSAM and can be enumerated and named (even if those names are short/opaque on some devices). 
+When the ACPI _STR is opaque (e.g., RTS1), you will need at least one of:
+
+A Windows driver reverse engineering result mapping IDs → physical sensors (linux-surface identifies this as potentially necessary). 
+Measurement correlation logs linking each zone to a physical heat source/workload.
+Key takeaways
+Surface Pro 7 and Surface Book 2 provide high-confidence, device-specific mappings because their ACPI ThermalZone _STR fields directly identify the sensor target (“Primary Battery”, “GPU”, “SSD Temp”, “SOC Temp”, “Tskin…”, “dGPU”, “Base battery”). 
+
+Surface Pro 8 demonstrates the main blocker to a universal “definitive mapping”: ThermalZone _STR identifiers can be opaque (RTS*, VTS*), and public primary sources may not contain the requisite semantic mapping. This limitation is explicitly recognised by the linux-surface reverse-engineering community. 
+
+The Surface thermal stack is strongly tied to the Surface System Aggregator Module (SSAM) in newer devices. Any serious attempt to complete the mapping across all Surface models should combine ACPI parsing with SSAM driver-level evidence (Linux) and/or Windows driver analysis and empirical measurement. 
