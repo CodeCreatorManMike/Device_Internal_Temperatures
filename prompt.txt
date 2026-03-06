@@ -1,0 +1,526 @@
+What’s actually true after checking Microsoft docs
+
+For Microsoft laptops running Windows 11 (primarily Surface Laptop / Surface Pro / Surface Laptop Studio), the documented Windows-native thermal path is the ACPI thermal-zone model, not a Surface-specific public temperature WMI provider. Windows documents that thermal management is built around ACPI thermal zones, where sensors track the temperature in those zones, and the ACPI driver registers thermal-zone devices for the OS.
+
+That means the best native PowerShell/WMI path is:
+
+root\wmi : MSAcpi_ThermalZoneTemperature
+
+plus Surface device/driver discovery to confirm the machine has the relevant Surface thermal/system drivers installed
+
+Two important caveats from Microsoft’s own documentation:
+
+Win32_TemperatureProbe is not a live temperature source; Microsoft explicitly says CurrentReading is not populated by current implementations because SMBIOS cannot provide real-time readings.
+
+Microsoft documents Surface driver and firmware components such as Surface UEFI, Surface ME, Surface Integration Service, and Surface thermal/system drivers in update history, but Microsoft does not publish a public Surface-specific WMI temperature class equivalent to HP CMI for per-component temps.
+
+So the honest conclusion is:
+
+Native, documented, Microsoft-supported temperature sources on Surface/Windows 11
+
+ACPI thermal zones via MSAcpi_ThermalZoneTemperature
+
+Surface thermal/system driver presence via PnP / signed-driver inventory
+
+Not Win32_TemperatureProbe for live temps
+
+No publicly documented Surface-specific WMI class for CPU/GPU/Battery/etc. temperatures the way HP exposes them via HP CMI
+
+What temperatures can actually be reported reliably
+
+For Microsoft laptops, the reliably accessible native list is:
+
+Whatever ACPI thermal zones the device exposes at runtime through MSAcpi_ThermalZoneTemperature
+
+plus the fact that the device has Surface thermal/system drivers installed
+
+Windows documents thermal zones as zones, not guaranteed component labels like CPU/GPU/Battery. OEMs can partition devices into one or more zones, and Windows can support shared sensors and OEM-specific thermal-zone behavior through ACPI extensions.
+
+So for Surface, the exact reliable rule is:
+
+All instances returned by root\wmi:MSAcpi_ThermalZoneTemperature are the native live temperatures you can trust from Windows without third-party libraries.
+
+What you cannot responsibly hardcode as guaranteed native Surface outputs:
+
+CPU package temp
+
+GPU temp
+
+PCH temp
+
+skin temp 1 / 2
+
+charging circuit temp
+
+battery temp
+
+Those may exist internally to firmware/thermal logic, but Microsoft does not publish a public WMI class that guarantees those labels for Surface devices.
+
+How to inspect this directly yourself
+
+These are the exact native commands worth using on a Surface / Microsoft laptop.
+
+1) Check the documented live thermal-zone class
+Get-CimClass -Namespace root\wmi -ClassName MSAcpi_ThermalZoneTemperature
+Get-CimInstance -Namespace root\wmi -ClassName MSAcpi_ThermalZoneTemperature |
+  Select-Object InstanceName, CurrentTemperature, CriticalTripPoint, PassiveTripPoint, ActiveTripPoint |
+  Format-Table -AutoSize
+2) Confirm Surface thermal/system-related devices and drivers
+Get-CimInstance Win32_PnPSignedDriver |
+  Where-Object {
+    $_.DeviceName -match 'Surface Thermal Zone Sensor|SurfaceSystemManagement|Surface Integration Service|Surface UEFI|Surface ME'
+  } |
+  Select-Object DeviceName, DriverVersion, Manufacturer, InfName, DriverDate |
+  Sort-Object DeviceName
+3) Check all thermal-ish devices in PnP
+Get-PnpDevice |
+  Where-Object {
+    $_.FriendlyName -match 'Thermal|Surface Thermal|SurfaceSystemManagement|Surface Integration Service'
+  } |
+  Select-Object Status, Class, FriendlyName, InstanceId
+4) Prove the native legacy probe is not useful for live temps
+Get-CimInstance -ClassName Win32_TemperatureProbe |
+  Select-Object Name, CurrentReading, Status, Description
+
+You should expect CurrentReading to be empty/unusable there, per Microsoft.
+
+Microsoft/Surface script
+
+This keeps your fixed schema, but does it honestly:
+
+primary source: MSAcpi_ThermalZoneTemperature
+
+inventories Surface thermal/system drivers
+
+fills fixed fields only when zone names strongly suggest a match
+
+otherwise preserves values in:
+
+SurfaceThermalZones_All
+
+SensorsRaw_List
+
+diagnostics
+
+<#
+.SYNOPSIS
+Collects native Microsoft/Surface thermal-zone temperatures on Windows 11 and outputs fixed fields plus diagnostics.
+
+.DESCRIPTION
+This script is designed for Microsoft laptops running Windows 11, especially Surface devices.
+
+Primary live temperature source:
+- Namespace: root\wmi
+- Class:     MSAcpi_ThermalZoneTemperature
+
+Why this path:
+- Windows thermal management is based on ACPI thermal zones.
+- Thermal sensors track temperatures for those zones.
+- The ACPI driver registers thermal zone devices for the OS.
+
+Important limitations:
+- Thermal zones are not guaranteed to map cleanly to CPU/GPU/Battery/etc.
+- Win32_TemperatureProbe is NOT used for live temps because Microsoft documents that CurrentReading is not populated by current implementations.
+- Microsoft does not publicly document a Surface-specific WMI temperature class equivalent to HP CMI.
+
+This script therefore:
+1) Enumerates all ACPI thermal zones
+2) Converts CurrentTemperature from tenths of Kelvin to Celsius
+3) Attempts conservative mapping into a fixed schema only when names clearly suggest a component
+4) Always returns the full native zone list in SurfaceThermalZones_All
+5) Reports relevant Surface thermal/system driver presence
+
+.FUNCTIONALITY
+Data collection
+
+.INPUTS
+None
+
+.OUTPUTS
+- TempCPU_C
+- TempGPU_C
+- TempExhaust_C
+- TempLocalHotspot_C
+- TempBattery_C
+- TempChargingCircuit_C
+- TempSkin1_C
+- TempSkin2_C
+- TempMisc_C
+- TempPCH_C
+- SensorsDetected_Count
+- SensorsSource
+- SensorsRaw_List
+- SurfaceThermalZones_All
+- SurfaceDrivers_List
+- DiagnosticsSummary
+- Diagnostics
+
+.NOTES
+Context:            LocalDevice / LocalUser
+Version:            1.0.0.0 - Microsoft/Surface native thermal-zone implementation
+Last Generated:     06 Mar 2026
+#>
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+trap {
+    $host.ui.WriteErrorLine($_.ToString())
+    exit 1
+}
+
+$NOT_AVAILABLE = -1.0
+
+$temps = @{
+    CPU              = $NOT_AVAILABLE
+    GPU              = $NOT_AVAILABLE
+    Exhaust          = $NOT_AVAILABLE
+    LocalHotspot     = $NOT_AVAILABLE
+    Battery          = $NOT_AVAILABLE
+    ChargingCircuit  = $NOT_AVAILABLE
+    Skin1            = $NOT_AVAILABLE
+    Skin2            = $NOT_AVAILABLE
+    Misc             = $NOT_AVAILABLE
+    PCH              = $NOT_AVAILABLE
+}
+
+$rawSensors   = New-Object System.Collections.Generic.List[string]
+$zoneList     = New-Object System.Collections.Generic.List[string]
+$driverList   = New-Object System.Collections.Generic.List[string]
+
+$diag = [ordered]@{
+    TimestampUtc = (Get-Date).ToUniversalTime().ToString("o")
+    RunningAsUser = "$env:USERDOMAIN\$env:USERNAME"
+    PSVersion = $PSVersionTable.PSVersion.ToString()
+    IsAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
+              ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+    ThermalZone = [ordered]@{
+        Namespace         = 'root\wmi'
+        Class             = 'MSAcpi_ThermalZoneTemperature'
+        ClassExists       = $false
+        QueryAttempted    = $false
+        QuerySucceeded    = $false
+        QueryError        = $null
+        InstancesReturned = 0
+        InstancesWithTemp = 0
+    }
+
+    LegacyProbe = [ordered]@{
+        Class             = 'Win32_TemperatureProbe'
+        Queried           = $false
+        InstancesReturned = 0
+        AnyCurrentReading = $false
+    }
+
+    SurfaceDrivers = [ordered]@{
+        QuerySucceeded    = $false
+        QueryError        = $null
+        MatchingDrivers   = 0
+    }
+}
+
+function Set-IfEmpty {
+    param(
+        [Parameter(Mandatory=$true)] [hashtable] $Table,
+        [Parameter(Mandatory=$true)] [string] $Key,
+        [Parameter(Mandatory=$true)] [double] $Value
+    )
+    if ($Table.ContainsKey($Key) -and ($Table[$Key] -eq $NOT_AVAILABLE)) {
+        $Table[$Key] = [double]$Value
+    }
+}
+
+function Convert-TenthsKelvinToCelsius {
+    param([uint32]$TenthsKelvin)
+    return [math]::Round((($TenthsKelvin / 10.0) - 273.15), 1)
+}
+
+function Get-FriendlyKeyFromZoneName {
+    param([Parameter(Mandatory=$true)] [string] $Text)
+
+    $t = $Text.ToLowerInvariant()
+
+    # Conservative mapping only.
+    if ($t -match 'cpu|proc|processor|package')      { return 'CPU' }
+    if ($t -match 'gpu|gfx|graphics|dgpu|igpu')      { return 'GPU' }
+    if ($t -match 'battery|batt')                    { return 'Battery' }
+    if ($t -match 'pch|platform\s*controller\s*hub') { return 'PCH' }
+    if ($t -match 'skin\s*1|skin1')                  { return 'Skin1' }
+    if ($t -match 'skin\s*2|skin2')                  { return 'Skin2' }
+    if ($t -match 'exhaust|vent|outlet')             { return 'Exhaust' }
+    if ($t -match 'charging|charger|vrm|regulator')  { return 'ChargingCircuit' }
+    if ($t -match 'local|hotspot|hot\s*spot')        { return 'LocalHotspot' }
+
+    return 'Misc'
+}
+
+function Try-CollectThermalZones {
+    param(
+        [hashtable]$TempsTable,
+        [System.Collections.Generic.List[string]]$RawList,
+        [System.Collections.Generic.List[string]]$ZoneList,
+        $DiagRoot
+    )
+
+    $ns = [string]$DiagRoot.ThermalZone.Namespace
+    $class = [string]$DiagRoot.ThermalZone.Class
+
+    try {
+        Get-CimClass -Namespace $ns -ClassName $class -ErrorAction Stop | Out-Null
+        $DiagRoot.ThermalZone.ClassExists = $true
+    } catch {
+        $DiagRoot.ThermalZone.ClassExists = $false
+        $DiagRoot.ThermalZone.QueryError = $_.Exception.Message
+        return @{ Count = 0 }
+    }
+
+    $DiagRoot.ThermalZone.QueryAttempted = $true
+    try {
+        $zones = @(Get-CimInstance -Namespace $ns -ClassName $class -ErrorAction Stop)
+        $DiagRoot.ThermalZone.QuerySucceeded = $true
+        $DiagRoot.ThermalZone.InstancesReturned = $zones.Count
+    } catch {
+        $DiagRoot.ThermalZone.QuerySucceeded = $false
+        $DiagRoot.ThermalZone.QueryError = $_.Exception.Message
+        return @{ Count = 0 }
+    }
+
+    foreach ($z in $zones) {
+        $name = [string]$z.InstanceName
+        $tempRaw = $z.CurrentTemperature
+
+        $rawLine = ("ACPI|InstanceName={0}|CurrentTemperature={1}|CriticalTripPoint={2}|PassiveTripPoint={3}|ActiveTripPoint={4}" -f `
+            $name, $z.CurrentTemperature, $z.CriticalTripPoint, $z.PassiveTripPoint, $z.ActiveTripPoint)
+        $RawList.Add($rawLine) | Out-Null
+
+        if ($null -eq $tempRaw) { continue }
+
+        $DiagRoot.ThermalZone.InstancesWithTemp++
+        $c = Convert-TenthsKelvinToCelsius -TenthsKelvin ([uint32]$tempRaw)
+
+        $ZoneList.Add(("{0}={1}" -f $name, $c)) | Out-Null
+
+        $friendly = Get-FriendlyKeyFromZoneName -Text $name
+        Set-IfEmpty -Table $TempsTable -Key $friendly -Value $c
+    }
+
+    return @{ Count = $zones.Count }
+}
+
+function Query-LegacyProbe {
+    param($DiagRoot)
+
+    $DiagRoot.LegacyProbe.Queried = $true
+    try {
+        $probes = @(Get-CimInstance -ClassName Win32_TemperatureProbe -ErrorAction Stop)
+        $DiagRoot.LegacyProbe.InstancesReturned = $probes.Count
+        foreach ($p in $probes) {
+            if ($null -ne $p.CurrentReading) {
+                $DiagRoot.LegacyProbe.AnyCurrentReading = $true
+                break
+            }
+        }
+    } catch {
+        # Ignore; this probe is diagnostic only
+    }
+}
+
+function Query-SurfaceDrivers {
+    param(
+        [System.Collections.Generic.List[string]]$DriverList,
+        $DiagRoot
+    )
+
+    try {
+        $drivers = @(Get-CimInstance Win32_PnPSignedDriver -ErrorAction Stop | Where-Object {
+            $_.DeviceName -match 'Surface Thermal Zone Sensor|SurfaceSystemManagement|Surface Integration Service|Surface UEFI|Surface ME'
+        })
+
+        $DiagRoot.SurfaceDrivers.QuerySucceeded = $true
+        $DiagRoot.SurfaceDrivers.MatchingDrivers = $drivers.Count
+
+        foreach ($d in $drivers) {
+            $DriverList.Add(("{0}|Version={1}|INF={2}" -f $d.DeviceName, $d.DriverVersion, $d.InfName)) | Out-Null
+        }
+    } catch {
+        $DiagRoot.SurfaceDrivers.QuerySucceeded = $false
+        $DiagRoot.SurfaceDrivers.QueryError = $_.Exception.Message
+    }
+}
+
+try {
+    $source = 'NONE'
+    $countDetected = 0
+
+    $tz = Try-CollectThermalZones -TempsTable $temps -RawList $rawSensors -ZoneList $zoneList -DiagRoot $diag
+    if ($tz.Count -gt 0) {
+        $source = 'ACPI_THERMAL_ZONE'
+        $countDetected = $tz.Count
+    }
+
+    Query-LegacyProbe -DiagRoot $diag
+    Query-SurfaceDrivers -DriverList $driverList -DiagRoot $diag
+
+    $summary = "Source=$source; " +
+               "ThermalZone(class=$($diag.ThermalZone.ClassExists), attempted=$($diag.ThermalZone.QueryAttempted), ok=$($diag.ThermalZone.QuerySucceeded), instances=$($diag.ThermalZone.InstancesReturned), withTemp=$($diag.ThermalZone.InstancesWithTemp)); " +
+               "LegacyProbe(instances=$($diag.LegacyProbe.InstancesReturned), anyCurrentReading=$($diag.LegacyProbe.AnyCurrentReading)); " +
+               "SurfaceDrivers(ok=$($diag.SurfaceDrivers.QuerySucceeded), matches=$($diag.SurfaceDrivers.MatchingDrivers))"
+
+    $out = [ordered]@{
+        TempCPU_C              = [float]$temps.CPU
+        TempGPU_C              = [float]$temps.GPU
+        TempExhaust_C          = [float]$temps.Exhaust
+        TempLocalHotspot_C     = [float]$temps.LocalHotspot
+        TempBattery_C          = [float]$temps.Battery
+        TempChargingCircuit_C  = [float]$temps.ChargingCircuit
+        TempSkin1_C            = [float]$temps.Skin1
+        TempSkin2_C            = [float]$temps.Skin2
+        TempMisc_C             = [float]$temps.Misc
+        TempPCH_C              = [float]$temps.PCH
+        SensorsDetected_Count  = [uint32]$countDetected
+        SensorsSource          = $source
+        SensorsRaw_List        = ""
+        SurfaceThermalZones_All= ""
+        SurfaceDrivers_List    = ""
+        DiagnosticsSummary     = $summary
+        Diagnostics            = $diag
+    }
+
+    $rawList = ($rawSensors | Select-Object -First 30) -join "; "
+    if ($rawList.Length -gt 900) { $rawList = $rawList.Substring(0, 900) }
+    $out.SensorsRaw_List = $rawList
+
+    $zonesOut = ($zoneList | Select-Object -First 30) -join "; "
+    if ($zonesOut.Length -gt 900) { $zonesOut = $zonesOut.Substring(0, 900) }
+    $out.SurfaceThermalZones_All = $zonesOut
+
+    $drvOut = ($driverList | Select-Object -First 20) -join "; "
+    if ($drvOut.Length -gt 900) { $drvOut = $drvOut.Substring(0, 900) }
+    $out.SurfaceDrivers_List = $drvOut
+
+    $out | ConvertTo-Json -Depth 7 -Compress | Write-Output
+    exit 0
+}
+catch {
+    $host.ui.WriteErrorLine($_.ToString())
+    exit 1
+}
+What this script achieves
+
+For Microsoft laptops running Windows 11, this is the most accurate native PowerShell/WMI implementation I can justify from documentation:
+
+It uses the documented live Windows thermal model: ACPI thermal zones.
+
+It avoids Win32_TemperatureProbe as a live source because Microsoft says it isn’t populated for real-time readings.
+
+It verifies Surface thermal/system-related drivers commonly seen in Surface update history and driver channels, such as Surface UEFI, Surface ME, Surface Integration Service, and Surface thermal/system drivers.
+
+It does not invent a fake Surface-specific temp class.
+
+What it does not guarantee:
+
+per-component CPU/GPU/Battery labels on every model
+
+because Windows’ native documented model is zone-based, and Microsoft does not publicly document a Surface-only equivalent of HP’s HP CMI component sensor model.
+
+Cursor / Codex prompt
+
+Use this one verbatim.
+
+Build a PowerShell 5.1+ script for Microsoft laptops running Windows 11, especially Surface devices, that collects native temperature information without third-party libraries.
+
+Use the documented Windows thermal path:
+
+namespace: root\wmi
+
+class: MSAcpi_ThermalZoneTemperature
+
+Do not rely on Win32_TemperatureProbe for live temps, because Microsoft documents that CurrentReading is not populated by current implementations. Query it only for diagnostics.
+
+Enumerate all instances of MSAcpi_ThermalZoneTemperature, and convert CurrentTemperature from tenths of Kelvin to Celsius using:
+C = (CurrentTemperature / 10.0) - 273.15
+
+Output a fixed schema:
+
+TempCPU_C
+
+TempGPU_C
+
+TempExhaust_C
+
+TempLocalHotspot_C
+
+TempBattery_C
+
+TempChargingCircuit_C
+
+TempSkin1_C
+
+TempSkin2_C
+
+TempMisc_C
+
+TempPCH_C
+
+SensorsDetected_Count
+
+SensorsSource
+
+SensorsRaw_List
+
+SurfaceThermalZones_All
+
+SurfaceDrivers_List
+
+DiagnosticsSummary
+
+Diagnostics
+
+Mapping rules:
+
+Use conservative name-based mapping from InstanceName only when the zone name clearly indicates a component such as CPU, GPU, battery, local hotspot, exhaust, skin, charging circuit, or PCH.
+
+If the zone name is ambiguous, place the reading in TempMisc_C.
+
+Never invent component assignments when the native zone name does not support it.
+
+Also inventory Microsoft/Surface thermal-related drivers using Win32_PnPSignedDriver, matching device names such as:
+
+Surface Thermal Zone Sensor
+
+SurfaceSystemManagement
+
+Surface Integration Service
+
+Surface UEFI
+
+Surface ME
+
+Include diagnostics showing:
+
+whether MSAcpi_ThermalZoneTemperature exists
+
+whether the query succeeded
+
+how many instances were returned
+
+whether Win32_TemperatureProbe returned any populated CurrentReading
+
+how many matching Surface drivers were found
+
+The script must be PowerShell 5.1-compatible, use Get-CimInstance, and emit a single JSON object to stdout.
+
+Bottom line
+
+For Microsoft / Surface on Windows 11, the safest researched answer is:
+
+Use ACPI thermal zones via MSAcpi_ThermalZoneTemperature
+
+Do not use Win32_TemperatureProbe for live temps
+
+Do not invent a Surface-specific WMI temp class unless you discover one on a specific machine
+
+Treat the runtime ACPI zone list as the true native temperature inventory
+
+If you want, I can do the same treatment next for Dell or Lenovo with the same level of detail.
