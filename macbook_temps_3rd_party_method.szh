@@ -1,0 +1,512 @@
+#!/bin/zsh
+# macbook-temps.szh — iSMC-based MacBook temperature collector (Apple Silicon, BSD-awk compatible)
+# Output: valid JSON + diagnostics; optional AllTemps (truncated).
+# Refactored: collect_ismc_samples, parse_rows, aggregate_category, emit_json.
+#
+# Mapping: CPU = Performance/Efficiency Core or CPU N; GPU = GPU|Graphics (excl. Fan);
+#   Battery = Battery; LocalHotspot = Airflow|Actuator|Ambient|Palm|Case|Skin|Logic|Board|Local;
+#   Misc = Drive|Airport|SSD|NAND|Wireless. Tweak patterns in run_agg_read/build_diag for other Mac models.
+#
+# Verify temps under load: run script every 2s; run CPU stress 30s; watch TempCPU_C then stop stress.
+# Run commands (copy only the zsh lines, not any comment):
+#   zsh ~/Desktop/macbook-temps.szh --selftest
+#   zsh ~/Desktop/macbook-temps.szh
+#   zsh ~/Desktop/macbook-temps.szh --alltemps
+#   zsh ~/Desktop/macbook-temps.szh --no-sudo
+
+set -u
+set -o pipefail
+export LC_ALL=C
+export LANG=C
+
+SAMPLES=5
+INTERVAL=1
+AGG="max"
+INCLUDE_ALLTEMPS=0
+ALLTEMPS_MAX_CHARS=900
+NO_SUDO=0
+DEBUG=0
+SELFTEST=0
+LOG="/tmp/macbook-temps.log"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --samples)    SAMPLES="${2:-5}"; shift 2;;
+    --interval)   INTERVAL="${2:-1}"; shift 2;;
+    --aggregate)  AGG="${2:-max}"; shift 2;;
+    --alltemps)   INCLUDE_ALLTEMPS=1; shift 1;;
+    --maxchars)   ALLTEMPS_MAX_CHARS="${2:-900}"; shift 2;;
+    --no-sudo)    NO_SUDO=1; shift 1;;
+    --debug)      DEBUG=1; shift 1;;
+    --selftest)   SELFTEST=1; shift 1;;
+    -h|--help)
+      cat <<'EOF'
+Usage:
+  zsh macbook-temps.szh [options]
+Options:
+  --samples N       Number of iSMC samples (default 5)
+  --interval N      Seconds between samples (default 1)
+  --aggregate max|avg  Rollup temps by max or avg (default max)
+  --alltemps        Include AllTemps_List (truncated)
+  --maxchars N      Truncate list strings to N chars (default 900)
+  --no-sudo         Skip powermetrics (no sudo); ThermalPressure set to ""
+  --debug           Extra preview arrays in Diagnostics
+  --selftest        Run once, print category counts, validate JSON
+  -h, --help        This help
+EOF
+      exit 0;;
+    *) echo "Unknown arg: $1" >&2; exit 2;;
+  esac
+done
+
+: >> "$LOG"
+log() { print -r -- "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] $*" >> "$LOG"; }
+
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"; s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"; s="${s//$'\t'/\\t}"
+  print -r -- "$s"
+}
+
+to_num_or_null() {
+  local v="${1:-}"
+  if [[ -z "$v" ]]; then
+    print -r -- "null"
+  else
+    LC_ALL=C awk -v x="$v" 'BEGIN{printf "%.1f", x}'
+  fi
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+ARCH="$(uname -m 2>/dev/null || echo unknown)"
+MODEL="$(sysctl -n hw.model 2>/dev/null || echo unknown)"
+OSV="$(sw_vers -productVersion 2>/dev/null || echo unknown)"
+BUILD="$(sw_vers -buildVersion 2>/dev/null || echo unknown)"
+USERN="$(id -un 2>/dev/null || echo unknown)"
+UIDN="$(id -u 2>/dev/null || echo 1)"
+ISROOT=false; [[ "$UIDN" -eq 0 ]] && ISROOT=true
+
+log "start samples=$SAMPLES interval=$INTERVAL aggregate=$AGG include_alltemps=$INCLUDE_ALLTEMPS maxchars=$ALLTEMPS_MAX_CHARS no_sudo=$NO_SUDO debug=$DEBUG selftest=$SELFTEST"
+log "env model=$MODEL arch=$ARCH os=$OSV build=$BUILD user=$USERN uid=$UIDN isroot=$ISROOT"
+
+# --- Locate iSMC ---
+ISMC=""
+if have iSMC; then
+  ISMC="$(command -v iSMC)"
+elif [[ -x "$HOME/go/bin/iSMC" ]]; then
+  ISMC="$HOME/go/bin/iSMC"
+fi
+ISMC_INSTALLED=false
+ISMC_OK=false
+ISMC_ERR=""
+RAW=""
+
+if [[ -n "${ISMC:-}" ]]; then
+  ISMC_INSTALLED=true
+  log "iSMC found at: $ISMC"
+else
+  ISMC_ERR="iSMC not found (not in PATH and not at ~/go/bin/iSMC)"
+  log "iSMC error: $ISMC_ERR"
+fi
+
+# --- collect_ismc_samples: run iSMC temp N times, append to RAW ---
+collect_ismc_samples() {
+  if ! $ISMC_INSTALLED; then
+    return
+  fi
+  for i in $(seq 1 "$SAMPLES"); do
+    out="$("$ISMC" temp 2>&1 || true)"
+    if [[ -z "${out//[[:space:]]/}" ]]; then
+      log "iSMC sample $i EMPTY"
+    else
+      RAW+="$out"$'\n'
+      log "iSMC sample $i OK bytes=${#out}"
+    fi
+    [[ "$i" -lt "$SAMPLES" ]] && sleep "$INTERVAL"
+  done
+  if [[ -n "${RAW//[[:space:]]/}" ]]; then
+    if print -r -- "$RAW" | grep -q "°C"; then
+      ISMC_OK=true
+      log "iSMC sanity OK (found °C)"
+    else
+      ISMC_OK=false
+      ISMC_ERR="iSMC output contained no °C; cannot parse temps"
+      log "iSMC sanity FAILED: $ISMC_ERR"
+      print -r -- "$RAW" | head -n 40 >> "$LOG"
+    fi
+  else
+    ISMC_OK=false
+    ISMC_ERR="iSMC produced no usable output across samples"
+    log "iSMC error: $ISMC_ERR"
+  fi
+}
+
+collect_ismc_samples
+
+# --- powermetrics thermal pressure (skip if --no-sudo) ---
+PM_PRESENT=false
+PM_THERM_OK=false
+THERMAL_PRESSURE=""
+PM_ERR=""
+
+if [[ "$NO_SUDO" -eq 1 ]]; then
+  PM_ERR="skipped (--no-sudo); no sudo prompt"
+  log "powermetrics skipped: $PM_ERR"
+else
+  if have powermetrics; then
+    PM_PRESENT=true
+    log "powermetrics present"
+    pm="$(sudo powermetrics --samplers thermal -n 1 2>/dev/null || true)"
+    if [[ -n "${pm//[[:space:]]/}" ]]; then
+      tp="$(print -r -- "$pm" | awk -F': ' '/Current pressure level|Thermal pressure/ {print $2; exit}')"
+      if [[ -z "${tp:-}" ]]; then
+        tp="$(print -r -- "$pm" | sed -n 's/.*[Tt]hermal pressure:[[:space:]]*\([^[:space:]]*\).*/\1/p' | head -1)"
+      fi
+      if [[ -n "${tp:-}" ]]; then
+        THERMAL_PRESSURE="${tp}"
+        PM_THERM_OK=true
+        log "thermal pressure=$THERMAL_PRESSURE"
+      else
+        PM_ERR="powermetrics output missing pressure level"
+        log "powermetrics note: $PM_ERR"
+      fi
+    else
+      PM_ERR="powermetrics thermal returned empty output"
+      log "powermetrics note: $PM_ERR"
+    fi
+  else
+    log "powermetrics not present"
+  fi
+fi
+
+# --- parse_rows: output lines "desc\tkey\tvalue" (tab-separated); skip headers ---
+# Identifies temp rows by °C; extracts Description (before KEY), KEY (token before value), Value (numeric before °C).
+parse_rows() {
+  print -r -- "$RAW" | LC_ALL=C awk '
+    $0 ~ /°C/ && $0 !~ /DESCRIPTION[[:space:]]+KEY[[:space:]]+VALUE/ && $0 !~ /^[[:space:]]*$/ {
+      line = $0
+      gsub(/[ \t]+/, " ", line)
+      sub(/^ /, "", line)
+      sub(/ $/, "", line)
+      n = split(line, parts, /°C/)
+      if (n < 1) next
+      left = parts[1]
+      gsub(/^ | $/, "", left)
+      nt = split(left, tok, " ")
+      if (nt < 2) next
+      value = tok[nt] + 0
+      key = tok[nt - 1]
+      desc = tok[1]
+      for (i = 2; i <= nt - 2; i++) desc = desc " " tok[i]
+      if (desc != "" && value != "" && value >= -100 && value <= 200)
+        print desc "\t" key "\t" value
+    }
+  '
+}
+
+# --- aggregate_category: regex_include, regex_exclude → max, source, count, min, avg, top5 ---
+# Reads parsed rows from stdin; matches description against include_re, excludes if match exclude_re.
+aggregate_category() {
+  local include_re="$1"
+  local exclude_re="${2:-}"
+  local parsed="$3"
+  print -r -- "$parsed" | LC_ALL=C awk -v inc="$include_re" -v exc="$exclude_re" -v agg="$AGG" '
+    BEGIN { FS = "\t"; nmatch = 0; max = ""; min = ""; sum = 0 }
+    NF >= 3 {
+      desc = $1
+      key = $2
+      val = $3 + 0
+      if (inc != "" && desc !~ inc) next
+      if (exc != "" && desc ~ exc) next
+      nmatch++
+      sum += val
+      if (min == "" || val < min) min = val
+      if (max == "" || val > max) { max = val; source = desc }
+      idx = nmatch
+      v[idx] = val
+      d[idx] = desc
+    }
+    END {
+      if (nmatch == 0) {
+        print ""
+        print ""
+        print 0
+        print ""
+        print ""
+        print ""
+        exit
+      }
+      avg = sum / nmatch
+      printf "%.6f\n", max
+      gsub(/\t/, " ", source)
+      print source
+      print nmatch
+      printf "%.6f\n", min
+      printf "%.6f\n", avg
+      # top 5: simple selection by value (descending)
+      for (k = 1; k <= 5 && k <= nmatch; k++) {
+        m = -1e9
+        mi = 0
+        for (i = 1; i <= nmatch; i++) {
+          if (!(i in used) && v[i] > m) { m = v[i]; mi = i }
+        }
+        if (mi == 0) break
+        used[mi] = 1
+        # Truncate long descriptions for JSON safety
+        dd = d[mi]
+        if (length(dd) > 50) dd = substr(dd, 1, 47) "..."
+        if (k > 1) top5 = top5 "; "
+        top5 = top5 dd "=" sprintf("%.1f", v[mi])
+      }
+      print top5
+    }
+  '
+}
+
+# --- Emit compact JSON (one line) to stdout; debug to LOG ---
+emit_json() {
+  local ts="$1"
+  local cpu_max="$2" cpu_src="$3" gpu_max="$4" gpu_src="$5" local_max="$6" local_src="$7"
+  local bat_max="$8" bat_src="$9" misc_max="${10}" misc_src="${11}"
+  local exh_max="${12}" exh_src="${13}" charge_max="${14}" charge_src="${15}"
+  local skin1_max="${16}" skin1_src="${17}" skin2_max="${18}" skin2_src="${19}"
+  local pch_max="${20}" pch_src="${21}"
+  local sens_count="$22" raw_preview="$23" diag_summary="$24" diag_obj="$25"
+  local alltemps_inc="$26" alltemps_trunc="$27" alltemps_list="$28"
+
+  printf '{'
+  printf '"TimestampUtc":"%s",' "$ts"
+  printf '"RunningAsUser":"%s",' "$(json_escape "$USERN")"
+  printf '"OSVersion":"%s",' "$(json_escape "$OSV")"
+  printf '"BuildVersion":"%s",' "$(json_escape "$BUILD")"
+  printf '"Model":"%s",' "$(json_escape "$MODEL")"
+  printf '"Arch":"%s",' "$(json_escape "$ARCH")"
+  printf '"IsRoot":%s,' "$ISROOT"
+  printf '"TempCPU_C":%s,"TempCPU_Source":"%s",' "$(to_num_or_null "$cpu_max")" "$(json_escape "$cpu_src")"
+  printf '"TempGPU_C":%s,"TempGPU_Source":"%s",' "$(to_num_or_null "$gpu_max")" "$(json_escape "$gpu_src")"
+  printf '"TempExhaust_C":%s,"TempExhaust_Source":"%s",' "$(to_num_or_null "$exh_max")" "$(json_escape "$exh_src")"
+  printf '"TempLocalHotspot_C":%s,"TempLocalHotspot_Source":"%s",' "$(to_num_or_null "$local_max")" "$(json_escape "$local_src")"
+  printf '"TempBattery_C":%s,"TempBattery_Source":"%s",' "$(to_num_or_null "$bat_max")" "$(json_escape "$bat_src")"
+  printf '"TempChargingCircuit_C":%s,"TempChargingCircuit_Source":"%s",' "$(to_num_or_null "$charge_max")" "$(json_escape "$charge_src")"
+  printf '"TempSkin1_C":%s,"TempSkin1_Source":"%s",' "$(to_num_or_null "$skin1_max")" "$(json_escape "$skin1_src")"
+  printf '"TempSkin2_C":%s,"TempSkin2_Source":"%s",' "$(to_num_or_null "$skin2_max")" "$(json_escape "$skin2_src")"
+  printf '"TempMisc_C":%s,"TempMisc_Source":"%s",' "$(to_num_or_null "$misc_max")" "$(json_escape "$misc_src")"
+  printf '"TempPCH_C":%s,"TempPCH_Source":"%s",' "$(to_num_or_null "$pch_max")" "$(json_escape "$pch_src")"
+  printf '"SensorsDetected_Count":%s,' "$sens_count"
+  printf '"SensorsSource":"%s",' "$(json_escape "${SENSORS_SOURCE:-NONE}")"
+  printf '"SensorsRaw_List":"%s",' "$(json_escape "$raw_preview")"
+  printf '"ThermalPressure":"%s",' "$(json_escape "$THERMAL_PRESSURE")"
+  printf '"DiagnosticsSummary":"%s",' "$(json_escape "$diag_summary")"
+  printf '"Diagnostics":%s,' "$diag_obj"
+  printf '"AllTemps_Included":%s,' "$alltemps_inc"
+  printf '"AllTemps_Truncated":%s,' "$alltemps_trunc"
+  printf '"AllTemps_List":"%s"}\n' "$(json_escape "$alltemps_list")"
+}
+
+# --- When iSMC failed: output minimal JSON and exit ---
+if ! $ISMC_OK; then
+  ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  diag_summary="iSMC(installed=$ISMC_INSTALLED ok=$ISMC_OK err=$ISMC_ERR) powermetrics(present=$PM_PRESENT therm_ok=$PM_THERM_OK pressure=$THERMAL_PRESSURE err=$PM_ERR) log=$LOG"
+  diag_obj=$(printf '{"iSMC":{"Installed":%s,"Path":"%s","Succeeded":%s,"Error":"%s"},"powermetrics":{"Present":%s,"ThermalSucceeded":%s,"ThermalPressure":"%s","Error":"%s"},"LogPath":"%s"}' \
+    "$ISMC_INSTALLED" "$(json_escape "${ISMC:-}")" "$ISMC_OK" "$(json_escape "$ISMC_ERR")" \
+    "$PM_PRESENT" "$PM_THERM_OK" "$(json_escape "$THERMAL_PRESSURE")" "$(json_escape "$PM_ERR")" "$(json_escape "$LOG")")
+  emit_json "$ts" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "0" "" "$diag_summary" "$diag_obj" "false" "false" ""
+  exit 0
+fi
+
+# --- Parse all temp rows (description, key, value) ---
+PARSED="$(parse_rows)"
+SENSOR_LINES="$(print -r -- "$PARSED" | wc -l | tr -d ' ')"
+SENSORS_SOURCE="iSMC"
+log "sensor_lines=$SENSOR_LINES"
+
+# Category patterns (description-based). Exclusions avoid non-temp (e.g. Fan).
+# CPU: Performance/Efficiency cores; exclude CPU Fan
+# GPU: GPU or Graphics; exclude GPU Fan
+# Battery: Battery (e.g. Battery 1)
+# LocalHotspot: Airflow, Actuator, Ambient, Palm, Case, Skin, Logic, Board, Local
+# Misc: Drive, Airport, SSD, NAND, Wireless, Charger
+# Exhaust/ChargingCircuit/Skin1/Skin2/PCH: best-effort, often null on Mac
+
+run_agg() {
+  local include_re="$1"
+  local exclude_re="${2:-}"
+  aggregate_category "$include_re" "$exclude_re" "$PARSED"
+}
+
+# Run aggregation for each category; read 6 lines: max, source, count, min, avg, top5
+run_agg_read() {
+  local out
+  out="$(run_agg "$1" "$2")"
+  local max="" src="" count=0 min="" avg="" top5=""
+  max="$(  print -r -- "$out" | sed -n '1p')"
+  src="$(  print -r -- "$out" | sed -n '2p')"
+  count="$(print -r -- "$out" | sed -n '3p')"
+  min="$(  print -r -- "$out" | sed -n '4p')"
+  avg="$(  print -r -- "$out" | sed -n '5p')"
+  top5="$( print -r -- "$out" | sed -n '6p')"
+  print -r -- "$max"
+  print -r -- "$src"
+  print -r -- "$count"
+  print -r -- "$min"
+  print -r -- "$avg"
+  print -r -- "$top5"
+}
+
+# CPU: CPU Performance Core, CPU Efficiency Core, or "CPU " (avoid CPU Fan)
+cpu_out="$(run_agg_read "CPU (Performance|Efficiency) Core|^CPU [0-9]" "Fan")"
+CPU_MAX="$(print -r -- "$cpu_out" | sed -n '1p')"
+CPU_SRC="$(print -r -- "$cpu_out" | sed -n '2p')"
+CPU_CNT="$(print -r -- "$cpu_out" | sed -n '3p')"
+CPU_MIN="$(print -r -- "$cpu_out" | sed -n '4p')"
+CPU_AVG="$(print -r -- "$cpu_out" | sed -n '5p')"
+CPU_TOP5="$(print -r -- "$cpu_out" | sed -n '6p')"
+
+# GPU: GPU or Graphics; exclude Fan
+gpu_out="$(run_agg_read "GPU|Graphics" "Fan")"
+GPU_MAX="$(print -r -- "$gpu_out" | sed -n '1p')"
+GPU_SRC="$(print -r -- "$gpu_out" | sed -n '2p')"
+GPU_CNT="$(print -r -- "$gpu_out" | sed -n '3p')"
+GPU_MIN="$(print -r -- "$gpu_out" | sed -n '4p')"
+GPU_AVG="$(print -r -- "$gpu_out" | sed -n '5p')"
+GPU_TOP5="$(print -r -- "$gpu_out" | sed -n '6p')"
+
+# Battery
+bat_out="$(run_agg_read "Battery" "")"
+BAT_MAX="$(print -r -- "$bat_out" | sed -n '1p')"
+BAT_SRC="$(print -r -- "$bat_out" | sed -n '2p')"
+BAT_CNT="$(print -r -- "$bat_out" | sed -n '3p')"
+BAT_MIN="$(print -r -- "$bat_out" | sed -n '4p')"
+BAT_AVG="$(print -r -- "$bat_out" | sed -n '5p')"
+BAT_TOP5="$(print -r -- "$bat_out" | sed -n '6p')"
+
+# LocalHotspot: Airflow, Actuator, Ambient, Palm, Case, Skin, Logic, Board, Local
+local_out="$(run_agg_read "Airflow|Actuator|Ambient|Palm|Case|Skin|Logic|Board|Local" "Fan")"
+LOCAL_MAX="$(print -r -- "$local_out" | sed -n '1p')"
+LOCAL_SRC="$(print -r -- "$local_out" | sed -n '2p')"
+LOCAL_CNT="$(print -r -- "$local_out" | sed -n '3p')"
+LOCAL_MIN="$(print -r -- "$local_out" | sed -n '4p')"
+LOCAL_AVG="$(print -r -- "$local_out" | sed -n '5p')"
+LOCAL_TOP5="$(print -r -- "$local_out" | sed -n '6p')"
+
+# Misc: Drive, Airport, SSD, NAND, Wireless, Memory, Package (catch-all for other internal temps)
+misc_out="$(run_agg_read "Drive|Airport|SSD|NAND|Wireless|Memory|Package" "Fan")"
+MISC_MAX="$(print -r -- "$misc_out" | sed -n '1p')"
+MISC_SRC="$(print -r -- "$misc_out" | sed -n '2p')"
+MISC_CNT="$(print -r -- "$misc_out" | sed -n '3p')"
+MISC_MIN="$(print -r -- "$misc_out" | sed -n '4p')"
+MISC_AVG="$(print -r -- "$misc_out" | sed -n '5p')"
+MISC_TOP5="$(print -r -- "$misc_out" | sed -n '6p')"
+
+# Exhaust (often null on Mac)
+exh_out="$(run_agg_read "Exhaust" "")"
+EXH_MAX="$(print -r -- "$exh_out" | sed -n '1p')"
+EXH_SRC="$(print -r -- "$exh_out" | sed -n '2p')"
+
+# Charging circuit
+charge_out="$(run_agg_read "Charger|Charging|Adapter" "Fan")"
+CHARGE_MAX="$(print -r -- "$charge_out" | sed -n '1p')"
+CHARGE_SRC="$(print -r -- "$charge_out" | sed -n '2p')"
+
+# Skin1 / Skin2
+skin1_out="$(run_agg_read "Skin 1|Skin1" "")"
+SKIN1_MAX="$(print -r -- "$skin1_out" | sed -n '1p')"
+SKIN1_SRC="$(print -r -- "$skin1_out" | sed -n '2p')"
+skin2_out="$(run_agg_read "Skin 2|Skin2" "")"
+SKIN2_MAX="$(print -r -- "$skin2_out" | sed -n '1p')"
+SKIN2_SRC="$(print -r -- "$skin2_out" | sed -n '2p')"
+
+# PCH
+pch_out="$(run_agg_read "PCH|Platform" "")"
+PCH_MAX="$(print -r -- "$pch_out" | sed -n '1p')"
+PCH_SRC="$(print -r -- "$pch_out" | sed -n '2p')"
+
+log "rollups cpu=${CPU_MAX:-NA} gpu=${GPU_MAX:-NA} batt=${BAT_MAX:-NA} local=${LOCAL_MAX:-NA} misc=${MISC_MAX:-NA}"
+
+# If GPU or Battery still null, log top matching descriptions for debugging (use tab FS; parsed lines are desc\tkey\tvalue)
+if [[ -z "${GPU_MAX:-}" ]] && [[ -n "$PARSED" ]]; then
+  gpu_lines="$(print -r -- "$PARSED" | awk -F'\t' -v inc="GPU|Graphics" -v exc="Fan" 'NF>=3 && $1~inc && (exc=="" || $1!~exc) {print $1 " " $3}' | head -10)"
+  log "GPU null: matching lines (desc value): $gpu_lines"
+fi
+if [[ -z "${BAT_MAX:-}" ]] && [[ -n "$PARSED" ]]; then
+  bat_lines="$(print -r -- "$PARSED" | awk -F'\t' -v inc="Battery" 'NF>=3 && $1~inc {print $1 " " $3}' | head -10)"
+  log "Battery null: matching lines (desc value): $bat_lines"
+fi
+
+# Raw preview (first 400 chars of first few sensor lines)
+RAW_PREVIEW="$(print -r -- "$PARSED" | head -5 | tr '\n' ' ' | head -c 400)"
+RAW_PREVIEW="${RAW_PREVIEW//$'\t'/ }"
+
+# AllTemps (optional)
+ALLTEMPS=""
+ALLTEMPS_TRUNC=false
+if [[ "$INCLUDE_ALLTEMPS" -eq 1 ]]; then
+  ALLTEMPS="$(print -r -- "$PARSED" | awk -F'\t' '{printf "%s=%.1fC; ", $1, $3}' | head -c $((ALLTEMPS_MAX_CHARS + 100)))"
+  if [[ ${#ALLTEMPS} -gt $ALLTEMPS_MAX_CHARS ]]; then
+    ALLTEMPS="${ALLTEMPS:0:$ALLTEMPS_MAX_CHARS}"
+    ALLTEMPS_TRUNC=true
+  fi
+fi
+
+# Build Diagnostics object (compact)
+build_diag() {
+  local cat_name="$1" pattern_inc="$2" pattern_exc="$3" cnt="$4" min_v="$5" max_v="$6" avg_v="$7" top5="$8" src="$9"
+  local reason=""
+  if [[ -z "$max_v" ]] || [[ "$cnt" -eq 0 ]]; then
+    reason="no matching sensors for pattern: $pattern_inc"
+    if [[ -n "$pattern_exc" ]]; then reason="${reason} exclude: $pattern_exc"; fi
+  fi
+  printf '"%s":{"Pattern":"%s","Exclude":"%s","Count":%s,"Min":%s,"Max":%s,"Avg":%s,"Top5":"%s","Source":"%s","Reason":"%s"}' \
+    "$cat_name" "$(json_escape "$pattern_inc")" "$(json_escape "$pattern_exc")" "$cnt" \
+    "$(to_num_or_null "$min_v")" "$(to_num_or_null "$max_v")" "$(to_num_or_null "$avg_v")" \
+    "$(json_escape "$top5")" "$(json_escape "$src")" "$(json_escape "$reason")"
+}
+
+DIAG_CPU="$(build_diag "CPU" "CPU (Performance|Efficiency) Core|^CPU [0-9]" "Fan" "$CPU_CNT" "$CPU_MIN" "$CPU_MAX" "$CPU_AVG" "$CPU_TOP5" "$CPU_SRC")"
+DIAG_GPU="$(build_diag "GPU" "GPU|Graphics" "Fan" "$GPU_CNT" "$GPU_MIN" "$GPU_MAX" "$GPU_AVG" "$GPU_TOP5" "$GPU_SRC")"
+DIAG_Battery="$(build_diag "Battery" "Battery" "" "$BAT_CNT" "$BAT_MIN" "$BAT_MAX" "$BAT_AVG" "$BAT_TOP5" "$BAT_SRC")"
+DIAG_LocalHotspot="$(build_diag "LocalHotspot" "Airflow|Actuator|Ambient|Palm|Case|Skin|Logic|Board|Local" "Fan" "$LOCAL_CNT" "$LOCAL_MIN" "$LOCAL_MAX" "$LOCAL_AVG" "$LOCAL_TOP5" "$LOCAL_SRC")"
+DIAG_Misc="$(build_diag "Misc" "Drive|Airport|SSD|NAND|Wireless|Memory|Package" "Fan" "$MISC_CNT" "$MISC_MIN" "$MISC_MAX" "$MISC_AVG" "$MISC_TOP5" "$MISC_SRC")"
+
+# Optional --debug: add short preview of first parsed lines to Diagnostics
+DEBUG_PREVIEW=""
+if [[ "$DEBUG" -eq 1 ]]; then
+  DEBUG_PREVIEW=",\"DebugPreview\":\"$(print -r -- "$PARSED" | head -8 | tr '\n' ' ' | head -c 500 | sed 's/"/\\"/g')\""
+fi
+DIAG_OBJ="{\"iSMC\":{\"Installed\":$ISMC_INSTALLED,\"Path\":\"$(json_escape "$ISMC")\",\"Succeeded\":$ISMC_OK,\"Error\":\"$(json_escape "$ISMC_ERR")\",\"Samples\":$SAMPLES,\"IntervalSec\":$INTERVAL,\"TempRowCount\":$SENSOR_LINES},\"powermetrics\":{\"Present\":$PM_PRESENT,\"ThermalSucceeded\":$PM_THERM_OK,\"ThermalPressure\":\"$(json_escape "$THERMAL_PRESSURE")\",\"Error\":\"$(json_escape "$PM_ERR")\"},\"LogPath\":\"$(json_escape "$LOG")\",\"Categories\":{$DIAG_CPU,$DIAG_GPU,$DIAG_Battery,$DIAG_LocalHotspot,$DIAG_Misc}$DEBUG_PREVIEW}"
+
+DIAG_SUMMARY="iSMC(path=$ISMC samples=$SAMPLES interval=$INTERVAL lines=$SENSOR_LINES) powermetrics(present=$PM_PRESENT therm_ok=$PM_THERM_OK pressure=$THERMAL_PRESSURE err=$PM_ERR) log=$LOG"
+
+# Source-of-truth keys for JSON (which sensor produced the value)
+ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+emit_json "$ts" "$CPU_MAX" "$CPU_SRC" "$GPU_MAX" "$GPU_SRC" "$LOCAL_MAX" "$LOCAL_SRC" "$BAT_MAX" "$BAT_SRC" "$MISC_MAX" "$MISC_SRC" \
+  "$EXH_MAX" "$EXH_SRC" "$CHARGE_MAX" "$CHARGE_SRC" "$SKIN1_MAX" "$SKIN1_SRC" "$SKIN2_MAX" "$SKIN2_SRC" "$PCH_MAX" "$PCH_SRC" \
+  "$SENSOR_LINES" "$RAW_PREVIEW" "$DIAG_SUMMARY" "$DIAG_OBJ" \
+  "$([[ "$INCLUDE_ALLTEMPS" -eq 1 ]] && echo true || echo false)" \
+  "$([[ "$ALLTEMPS_TRUNC" == true ]] && echo true || echo false)" \
+  "$ALLTEMPS"
+
+# --- --selftest: run once, print counts, validate JSON ---
+if [[ "$SELFTEST" -eq 1 ]]; then
+  print -r -- "Category counts: CPU=$CPU_CNT GPU=$GPU_CNT Battery=$BAT_CNT LocalHotspot=$LOCAL_CNT Misc=$MISC_CNT" >> "$LOG"
+  print -r -- "CPU top5: $CPU_TOP5" >> "$LOG"
+  print -r -- "GPU top5: $GPU_TOP5" >> "$LOG"
+  print -r -- "Battery top5: $BAT_TOP5" >> "$LOG"
+  if have python3; then
+        # Re-run last emit and validate with python
+        # (We already emitted; re-run script with same args but capture JSON and validate)
+        out="$(zsh -f "$0" --samples 1 --interval 0 --no-sudo 2>/dev/null | tail -1)"
+        if printf '%s' "$out" | python3 -m json.tool >/dev/null 2>&1; then
+          print -r -- "JSON parse: OK" >> "$LOG"
+          print -r -- "JSON parse: OK" >&2
+        else
+          print -r -- "JSON parse: FAIL" >> "$LOG"
+          print -r -- "JSON parse: FAIL" >&2
+        fi
+  else
+        print -r -- "JSON parse: (python3 not available) OK" >> "$LOG"
+        print -r -- "OK (python3 not available)" >&2
+  fi
+fi
