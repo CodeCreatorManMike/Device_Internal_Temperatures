@@ -4,9 +4,8 @@ set -u
 set -o pipefail
 export LC_ALL=C
 
-# -----------------------------------------------------------------------------
 # Nexthink-ready macOS battery / thermal inventory script
-#
+
 # Recommended Nexthink context:
 # - Interactive User
 #
@@ -30,13 +29,12 @@ export LC_ALL=C
 # - ThermalWarningLevel       (String)
 # - PerformanceWarningLevel   (String)
 # - CpuPowerStatus            (String)
-# -----------------------------------------------------------------------------
+
 
 readonly MAX_OUTPUT_LEN=1000
 EMITTED=0
 
-# ----- fixed output defaults --------------------------------------------------
-
+# output Defaults:
 Status="Error"
 Success="false"
 ErrorMessage="Unknown error"
@@ -58,7 +56,7 @@ ThermalWarningLevel="not available"
 PerformanceWarningLevel="not available"
 CpuPowerStatus="not available"
 
-# ----- helpers ----------------------------------------------------------------
+# helpers:
 
 trim_output() {
   local value="${1:-}"
@@ -167,7 +165,7 @@ calc_health_percent() {
   fi
 }
 
-# ----- main -------------------------------------------------------------------
+# main: 
 
 pm_batt="$(pmset -g batt 2>/dev/null || true)"
 pm_therm="$(pmset -g therm 2>/dev/null || true)"
