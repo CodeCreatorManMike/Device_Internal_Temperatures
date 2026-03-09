@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Temporary build files
 SRC="$(mktemp -t appletemps).m"
 BIN="$(mktemp -t appletempsbin)"
 
@@ -18,16 +17,6 @@ cat > "$SRC" <<'EOF'
 #import <string.h>
 #import <stdint.h>
 
-/*
- Apple Silicon temperature helper
- Supports:
-   • IOHID sensors (macOS 12–13)
-   • AppleSMC keys (macOS 14+)
-
- This mirrors the approach used in macmon and described in:
- https://medium.com/@vladkens/how-to-get-macos-power-metrics-with-rust-d42b0ad53967
-*/
-
 typedef const void * IOHIDEventSystemClient;
 typedef const void * IOHIDServiceClient;
 typedef const void * IOHIDEvent;
@@ -39,48 +28,115 @@ typedef CFTypeRef (*IOHIDServiceClientCopyProperty_f)(IOHIDServiceClient, CFStri
 typedef IOHIDEvent (*IOHIDServiceClientCopyEvent_f)(IOHIDServiceClient, long long, int, long long);
 typedef double (*IOHIDEventGetFloatValue_f)(IOHIDEvent, uint32_t);
 
-static uint32_t fourcc(const char *s) {
-  return ((uint32_t)s[0] << 24) | ((uint32_t)s[1] << 16) | ((uint32_t)s[2] << 8) | (uint32_t)s[3];
+static NSString *normalizeSensorName(NSString *name) {
+  if (!name || [name length] == 0) return @"unknown_sensor_c";
+
+  NSString *lower = [name lowercaseString];
+
+  if ([lower isEqualToString:@"gas gauge battery"]) {
+    return @"battery_gas_gauge_c";
+  }
+
+  if ([lower isEqualToString:@"pmu tcal"]) {
+    return @"pmu_calibration_c";
+  }
+
+  if ([lower hasPrefix:@"pmu tdie"]) {
+    NSString *suffix = [name substringFromIndex:[@"PMU tdie" length]];
+    if ([suffix length] > 0) {
+      return [NSString stringWithFormat:@"cpu_die_%@_c", suffix];
+    }
+    return @"cpu_die_c";
+  }
+
+  if ([lower hasPrefix:@"pmu tdev"]) {
+    NSString *suffix = [name substringFromIndex:[@"PMU tdev" length]];
+    if ([suffix length] > 0) {
+      return [NSString stringWithFormat:@"cpu_proximity_%@_c", suffix];
+    }
+    return @"cpu_proximity_c";
+  }
+
+  if ([lower hasPrefix:@"nand ch"] && [lower hasSuffix:@" temp"]) {
+    NSString *mid = [lower stringByReplacingOccurrencesOfString:@"nand " withString:@""];
+    mid = [mid stringByReplacingOccurrencesOfString:@" temp" withString:@""];
+    mid = [mid stringByReplacingOccurrencesOfString:@" " withString:@"_"];
+    return [NSString stringWithFormat:@"nand_%@_c", mid];
+  }
+
+  NSString *clean = lower;
+  clean = [clean stringByReplacingOccurrencesOfString:@" " withString:@"_"];
+  clean = [clean stringByReplacingOccurrencesOfString:@"-" withString:@"_"];
+  clean = [clean stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
+
+  NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:@"abcdefghijklmnopqrstuvwxyz0123456789_"];
+  NSMutableString *result = [NSMutableString string];
+  for (NSUInteger i = 0; i < [clean length]; i++) {
+    unichar ch = [clean characterAtIndex:i];
+    if ([allowed characterIsMember:ch]) {
+      [result appendFormat:@"%C", ch];
+    }
+  }
+
+  while ([result containsString:@"__"]) {
+    [result replaceOccurrencesOfString:@"__"
+                            withString:@"_"
+                               options:0
+                                 range:NSMakeRange(0, [result length])];
+  }
+
+  if ([result hasPrefix:@"_"]) {
+    [result deleteCharactersInRange:NSMakeRange(0, 1)];
+  }
+  if ([result hasSuffix:@"_"]) {
+    [result deleteCharactersInRange:NSMakeRange([result length] - 1, 1)];
+  }
+
+  if ([result length] == 0) {
+    return @"unknown_sensor_c";
+  }
+
+  return [NSString stringWithFormat:@"%@_c", result];
 }
 
 NSArray* readIOHIDTemps() {
-
   void *h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
   if (!h) return @[];
 
   IOHIDEventSystemClientCreate_f create =
-    dlsym(h,"IOHIDEventSystemClientCreate");
+    dlsym(h, "IOHIDEventSystemClientCreate");
   IOHIDEventSystemClientSetMatching_f setMatch =
-    dlsym(h,"IOHIDEventSystemClientSetMatching");
+    dlsym(h, "IOHIDEventSystemClientSetMatching");
   IOHIDEventSystemClientCopyServices_f copyServices =
-    dlsym(h,"IOHIDEventSystemClientCopyServices");
+    dlsym(h, "IOHIDEventSystemClientCopyServices");
   IOHIDServiceClientCopyProperty_f copyProp =
-    dlsym(h,"IOHIDServiceClientCopyProperty");
+    dlsym(h, "IOHIDServiceClientCopyProperty");
   IOHIDServiceClientCopyEvent_f copyEvent =
-    dlsym(h,"IOHIDServiceClientCopyEvent");
+    dlsym(h, "IOHIDServiceClientCopyEvent");
   IOHIDEventGetFloatValue_f getVal =
-    dlsym(h,"IOHIDEventGetFloatValue");
+    dlsym(h, "IOHIDEventGetFloatValue");
 
-  if (!create || !setMatch || !copyServices || !copyProp || !copyEvent || !getVal)
+  if (!create || !setMatch || !copyServices || !copyProp || !copyEvent || !getVal) {
     return @[];
+  }
 
   IOHIDEventSystemClient client = create(kCFAllocatorDefault);
 
-  int page=65280;
-  int usage=5;
+  int page = 65280;
+  int usage = 5;
 
-  CFNumberRef p = CFNumberCreate(kCFAllocatorDefault,kCFNumberIntType,&page);
-  CFNumberRef u = CFNumberCreate(kCFAllocatorDefault,kCFNumberIntType,&usage);
+  CFNumberRef p = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &page);
+  CFNumberRef u = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &usage);
 
-  const void *keys[]={CFSTR("PrimaryUsagePage"),CFSTR("PrimaryUsage")};
-  const void *vals[]={p,u};
+  const void *keys[] = { CFSTR("PrimaryUsagePage"), CFSTR("PrimaryUsage") };
+  const void *vals[] = { p, u };
 
   CFDictionaryRef match =
-    CFDictionaryCreate(kCFAllocatorDefault,keys,vals,2,
+    CFDictionaryCreate(kCFAllocatorDefault, keys, vals, 2,
                        &kCFTypeDictionaryKeyCallBacks,
                        &kCFTypeDictionaryValueCallBacks);
 
-  setMatch(client,match);
+  setMatch(client, match);
 
   CFRelease(match);
   CFRelease(p);
@@ -89,63 +145,63 @@ NSArray* readIOHIDTemps() {
   CFArrayRef services = copyServices(client);
   if (!services) return @[];
 
-  NSMutableArray *out=[NSMutableArray array];
+  NSMutableArray *out = [NSMutableArray array];
+  CFIndex count = CFArrayGetCount(services);
 
-  CFIndex count=CFArrayGetCount(services);
+  for (CFIndex i = 0; i < count; i++) {
+    IOHIDServiceClient svc = (IOHIDServiceClient)CFArrayGetValueAtIndex(services, i);
+    if (!svc) continue;
 
-  for(CFIndex i=0;i<count;i++){
+    NSString *name = nil;
 
-    IOHIDServiceClient svc=(IOHIDServiceClient)CFArrayGetValueAtIndex(services,i);
-    if(!svc) continue;
-
-    NSString *name=nil;
-
-    CFTypeRef prod=copyProp(svc,CFSTR("Product"));
-    if(prod && CFGetTypeID(prod)==CFStringGetTypeID()){
-      name=[(__bridge NSString*)prod copy];
+    CFTypeRef prod = copyProp(svc, CFSTR("Product"));
+    if (prod && CFGetTypeID(prod) == CFStringGetTypeID()) {
+      name = [(__bridge NSString*)prod copy];
     }
-    if(prod) CFRelease(prod);
+    if (prod) CFRelease(prod);
 
-    if(!name)
-      name=[NSString stringWithFormat:@"sensor_%ld",(long)i];
+    if (!name) {
+      name = [NSString stringWithFormat:@"sensor_%ld", (long)i];
+    }
 
-    IOHIDEvent ev=copyEvent(svc,15,0,0);
-    if(!ev) continue;
+    IOHIDEvent ev = copyEvent(svc, 15, 0, 0);
+    if (!ev) continue;
 
-    double c=getVal(ev,983040);
+    double c = getVal(ev, 983040);
 
-    if(c>-200 && c<200){
-      [out addObject:@{@"name":name,@"c":@(c)}];
+    if (c > -200 && c < 200) {
+      [out addObject:@{
+        @"name": name,
+        @"normalized_name": normalizeSensorName(name),
+        @"c": @(c)
+      }];
     }
   }
 
   CFRelease(services);
-
   return out;
 }
 
 int main() {
-
   @autoreleasepool {
+    NSArray *temps = readIOHIDTemps();
 
-    NSArray *temps=readIOHIDTemps();
-
-    if([temps count]==0){
-      printf("No IOHID temps found (likely macOS 14+, SMC path needed)\n");
+    if ([temps count] == 0) {
+      printf("status=no_iouid_temps_found\n");
+      printf("message=likely_macos_14_or_newer_smc_path_needed\n");
       return 0;
     }
 
-    for(NSDictionary *d in temps){
-      NSString *n=d[@"name"];
-      double v=[d[@"c"] doubleValue];
-      printf("%s\t%.1f\n",[n UTF8String],v);
+    for (NSDictionary *d in temps) {
+      NSString *normalized = d[@"normalized_name"];
+      double v = [d[@"c"] doubleValue];
+      printf("%s=%.1f\n", [normalized UTF8String], v);
     }
   }
 
   return 0;
 }
 EOF
-
 
 SDK="$(xcrun --sdk macosx --show-sdk-path)"
 
