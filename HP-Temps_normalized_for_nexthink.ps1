@@ -1,8 +1,8 @@
 <#
-.SYNOPSIS
+.SYNOPSIS:
 Collects device ACPI thermal zone temperatures and outputs fixed fields for Nexthink.
 
-.DESCRIPTION
+.DESCRIPTION:
 Queries Windows WMI class MSAcpi_ThermalZoneTemperature (root\wmi) to retrieve ACPI thermal zone
 temperatures (when exposed by the device firmware/drivers).
 
@@ -11,13 +11,13 @@ labels (CPU, GPU, Battery, etc.), and writes a fixed set of output fields to Nex
 
 If a sensor is not available on a device, its output is set to -1.
 
-.FUNCTIONALITY
+.FUNCTIONALITY:
 Data collection
 
-.INPUTS
+.INPUTS:
 None
 
-.OUTPUTS
+.OUTPUTS:
 - TempCPU_C
 - TempGPU_C
 - TempExhaust_C
@@ -31,29 +31,28 @@ None
 - SensorsDetected_Count
 - SensorsRaw_List
 
-.NOTES
+.NOTES:
 Context:            InteractiveUser
 Version:            1.0.0.0 - Initial version
 Last Generated:     21 Jan 2026
 #>
 
-# Load Nexthink output writer
+# Load Nexthink output writer:
 Add-Type -Path "$env:NEXTHINK\RemoteActions\nxtremoteactions.dll"
 
-# Default error handler recommended for Nexthink Remote Actions
+# Default error handler recommended for Nexthink Remote Actions:
 trap {
     $host.ui.WriteErrorLine($_.ToString())
     exit 1
 }
 
 
-# Constants / helpers
+# Constants / helpers:
 
-
-# Fixed “not available” value for missing sensors
+# Fixed “not available” value for missing sensors:
 $NOT_AVAILABLE = -1.0
 
-# Raw ACPI name -> Friendly label
+# Raw ACPI name -> Friendly label:
 $Map = @{
     "ACPI\ThermalZone\CPUZ_0" = "CPU"
     "ACPI\ThermalZone\GFXZ_0" = "GPU"
@@ -73,7 +72,7 @@ function Convert-ToCelsius {
     return [math]::Round(($TenthsKelvin / 10.0) - 273.15, 1)
 }
 
-# We keep a fixed output schema by predefining all expected temperatures
+# We keep a fixed output schema by predefining all expected temperatures:
 $temps = @{
     CPU              = $NOT_AVAILABLE
     GPU              = $NOT_AVAILABLE
@@ -91,10 +90,10 @@ $temps = @{
 # Main
 
 try {
-    # Query WMI (may return 0 objects on some devices)
+    # Query WMI (may return 0 objects on some devices):
     $sensors = Get-CimInstance -Namespace "root\wmi" -ClassName MSAcpi_ThermalZoneTemperature -ErrorAction Stop
 
-    # Build a raw list for troubleshooting/visibility (kept small)
+    # Build a raw list for troubleshooting/visibility (kept small):
     $rawNames = @()
 
     foreach ($s in $sensors) {
@@ -105,7 +104,7 @@ try {
 
         $c = Convert-ToCelsius -TenthsKelvin $s.CurrentTemperature
 
-        # Map raw -> friendly “key”
+        # Map raw -> friendly “key”:
         if ($Map.ContainsKey($raw)) {
             $friendlyKey = $Map[$raw]
             # Only write into our fixed schema keys
@@ -115,24 +114,24 @@ try {
         }
     }
 
-    # Write fixed outputs (float fields)
-    [Nxt]::WriteOutputFloat("TempCPU_C",             [float]$temps.CPU)
-    [Nxt]::WriteOutputFloat("TempGPU_C",             [float]$temps.GPU)
-    [Nxt]::WriteOutputFloat("TempExhaust_C",         [float]$temps.Exhaust)
-    [Nxt]::WriteOutputFloat("TempLocalHotspot_C",    [float]$temps.LocalHotspot)
-    [Nxt]::WriteOutputFloat("TempBattery_C",         [float]$temps.Battery)
-    [Nxt]::WriteOutputFloat("TempChargingCircuit_C", [float]$temps.ChargingCircuit)
-    [Nxt]::WriteOutputFloat("TempSkin1_C",           [float]$temps.Skin1)
-    [Nxt]::WriteOutputFloat("TempSkin2_C",           [float]$temps.Skin2)
-    [Nxt]::WriteOutputFloat("TempMisc_C",            [float]$temps.Misc)
-    [Nxt]::WriteOutputFloat("TempPCH_C",             [float]$temps.PCH)
+    # Write fixed outputs (float fields):
+    [Nxt]::WriteOutputFloat("TempCPU_C",$temps.CPU)
+    [Nxt]::WriteOutputFloat("TempGPU_C",$temps.GPU)
+    [Nxt]::WriteOutputFloat("TempExhaust_C",$temps.Exhaust)
+    [Nxt]::WriteOutputFloat("TempLocalHotspot_C",$temps.LocalHotspot)
+    [Nxt]::WriteOutputFloat("TempBattery_C",$temps.Battery)
+    [Nxt]::WriteOutputFloat("TempChargingCircuit_C",$temps.ChargingCircuit)
+    [Nxt]::WriteOutputFloat("TempSkin1_C",$temps.Skin1)
+    [Nxt]::WriteOutputFloat("TempSkin2_C",$temps.Skin2)
+    [Nxt]::WriteOutputFloat("TempMisc_C",$temps.Misc)
+    [Nxt]::WriteOutputFloat("TempPCH_C",$temps.PCH)
 
-    # Helpful meta outputs
+    # Helpful meta outputs:
     $count = 0
     if ($sensors) { $count = @($sensors).Count }
     [Nxt]::WriteOutputUInt32("SensorsDetected_Count", [uint32]$count)
 
-    # Keep under Nexthink string size limits: truncate defensively
+    # Keep under Nexthink string size limits: truncate defensively:
     $rawList = ($rawNames | Select-Object -First 30) -join "; "
     if ($rawList.Length -gt 900) { $rawList = $rawList.Substring(0, 900) }
     [Nxt]::WriteOutputString("SensorsRaw_List", $rawList)
