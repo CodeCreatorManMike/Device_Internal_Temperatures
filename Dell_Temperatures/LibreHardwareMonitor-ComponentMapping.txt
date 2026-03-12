@@ -1,0 +1,40 @@
+LibreHardwareMonitor – Component and sensor mapping (from GitHub/source)
+========================================================================
+
+HOW IT MAPS TO YOUR DEVICE
+--------------------------
+• Each temperature sensor belongs to a Hardware (IHardware). The sensor’s parent is in sensor.Hardware.Name.
+• The script now prints: "Component | Sensor : Value" so you see which device each temperature is for.
+
+COMPONENT TYPES (HardwareType in the library)
+---------------------------------------------
+• CPU        – Processor package and cores (e.g. "11th Gen Intel Core i7-1165G7"). Sensors: CPU Package, CPU Core #1, Core Max, etc.
+• GpuNvidia  – NVIDIA GPU. Sensors: GPU Core, GPU Memory, etc.
+• GpuAmd     – AMD GPU. Sensors: GPU Core, GPU Memory, etc.
+• GpuIntel   – Intel integrated GPU. Sensors: GPU Core, etc.
+• Motherboard – Chipset/Super I/O (e.g. Nuvoton, ITE). Sensors: PCH, System, CPU VRM, etc.
+• Storage    – Drives (NVMe, SATA). Sensors: Temperature, Composite Temperature (often one per drive).
+• SuperIO    – Under Motherboard. EC/super I/O chip temps.
+• Battery    – Battery pack temperature (if exposed).
+• Psu        – Power supply (mainly desktops with PSU reporting).
+
+WHY YOU MIGHT SEE FEWER SENSORS
+-------------------------------
+• Laptops often expose fewer WMI/EC sensors than desktops; the library only shows what the firmware/drivers provide.
+• "Composite Temperature", "Temperature #1/#2", "Warning/Critical" are typical for storage (e.g. NVMe). The component name (left of "|") is the drive or controller.
+• Run the script as Administrator for best access to EC and chipset sensors.
+• Dell Latitudes may expose most temps via storage and one chipset/EC device; CPU/GPU temps sometimes need kernel-level access the library may not have on all OEMs.
+
+WHAT EACH OUTPUT LINE MEANS NOW
+-------------------------------
+  "Component | Sensor : Value"
+  - Component = parent hardware name (e.g. "BC711 NVMe SK hynix 256GB", "Intel Core i7", "Nuvoton NCT6687D").
+  - Sensor    = sensor name (e.g. "Composite Temperature", "CPU Package", "GPU Core").
+  - Value     = temperature in Celsius.
+
+REFERENCE (GitHub)
+------------------
+- IHardware: Name, HardwareType, Sensors, SubHardware, Parent.
+- ISensor: Name, SensorType, Value, Min, Max; Hardware (parent).
+- Computer: IsCpuEnabled, IsGpuEnabled, IsStorageEnabled, IsMotherboardEnabled, etc.
+- Source: https://github.com/LibreHardwareMonitor/LibreHardwareMonitor (LibreHardwareMonitorLib/Hardware/).
